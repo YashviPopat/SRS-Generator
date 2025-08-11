@@ -1,0 +1,72 @@
+{
+    "Introduction": {
+      "Document Purpose": "Purpose of the document itself.",
+      "Project Purpose": "Why the project exists and its intended outcome.",
+      "Project Objectives": "Goals the project aims to achieve.",
+      "Project Stakeholders": "Key individuals or groups involved in or affected by the project.",
+      "Assumptions": "Conditions assumed to be true for the purpose of this document.",
+      "Acronyms and Abbreviations": "Glossary of short forms used throughout the document."
+    },
+    "User Personas" : {
+      "User Personas" : "Tells about roles involved in particular project."
+    },
+    "Scope": {
+      "Scope": "Defines boundaries, limits, and coverage of the system."
+    },
+    "Sequence Diagram": {
+      "Sequence Diagram": "Illustration of interaction flow among system components."
+    },
+    "Functional Requirements": {
+      "Use Case 1": "If applicable regarding to topic: It gives the details of the use case."
+    },
+    "Non-Functional Requirements": {
+      "Non-Functional Requirements": "Performance, reliability, usability, etc."
+    },
+    "System Requirements": {
+      "User Interface": "Front-end behavior and layout.",
+      "Database": "Backend data handling specifications.",
+      "Communication/Security": "Security protocols and communication standards.",
+      "System Integration": "Integration with external/internal systems.",
+      "Constraints and Limitation": "Known system limitations.",
+      "Legal": {
+        "Data Protection and Privacy": "Data handling policies.",
+        "Liability Limitation": "Liability coverage terms."
+      }
+    },
+    "System Architecture": {
+      "Overview": "Top-level system architecture view.",
+      "AI Subsystems": {
+        "Router & Orchestration Layer": "Flow control for AI subsystems.",
+        "Knowledge-Centric Q&A Route": "Handle Q&A using knowledge base.",
+        "Fallback & Governance Logic": "Handle exceptions and control logic."
+      },
+      "N-tier Architecture": {
+        "Presentation Component": "User interface layer.",
+        "Business Logic Component": "Application logic layer.",
+        "Data Access Component": "Database access routines.",
+        "Communication & Security Component": "Handles secure communication.",
+        "API Component": "Exposes application interfaces."
+      },
+      "Microservices Architecture": {
+        "Key Benefits": "Advantages of using microservices.",
+        "Core Microservices and Their Responsibilities": "Individual service responsibilities.",
+        "Communication and Integration Pattern": "How services interact.",
+        "Security and Compliance (Offline-Oriented)": "Offline system security."
+      },
+      "Method of Development": "Development strategy or methodology.",
+      "High-Level Technical Design": "Technical overview and structure."
+    },
+    "Hardware Requirements": {
+      "Hardware Requirements": "Minimum and recommended system specs."
+    },
+    "Acceptance Criteria": {
+      "Acceptance Criteria": "Conditions to meet for project sign-off."
+    },
+    "Product Future": {
+      "Product Future": "Possible improvements or additions."
+    },
+    "Open Queries": {
+      "Open Queries": "Unresolved issues or pending decisions."
+    }
+  }
+  
