@@ -10,6 +10,7 @@ import {
 } from '@heroicons/react/24/outline';
 import { useDocumentData } from '../DocumentDataContext';
 import { srsApi, errorHandler } from '../api/srsApi';
+import DiagramManager from '../components/DiagramManager';
 
 const SRSHeadingsEditor = () => {
   const navigate = useNavigate();
@@ -17,6 +18,8 @@ const SRSHeadingsEditor = () => {
   const [loading, setLoading] = useState(true);
   const [processingFiles, setProcessingFiles] = useState(false);
   const [generatingSRS, setGeneratingSRS] = useState(false);
+  const [generatedDocumentId, setGeneratedDocumentId] = useState(null);
+  const [showDiagramManager, setShowDiagramManager] = useState(false);
   
   // State for different types of headings
   const [aiGeneratedHeadings, setAiGeneratedHeadings] = useState(documentData.aiGeneratedHeadings || {});
@@ -42,6 +45,8 @@ const SRSHeadingsEditor = () => {
   const [headingCustomPrompts, setHeadingCustomPrompts] = useState({});
   const [showPromptBox, setShowPromptBox] = useState({});
 
+
+
   // Helper function to toggle custom prompt box visibility
   const togglePromptBox = (headingKey) => {
     setShowPromptBox(prev => ({
@@ -57,6 +62,8 @@ const SRSHeadingsEditor = () => {
       [headingKey]: prompt
     }));
   };
+
+
 
   // Helper functions for managing subheadings
   const toggleSubheadingView = (sectionId) => {
@@ -408,7 +415,7 @@ const SRSHeadingsEditor = () => {
         if (data.gemini_headings && Object.keys(data.gemini_headings).length > 0) {
           const firstKey = Object.keys(data.gemini_headings)[0];
           if (firstKey === "Introduction" && data.gemini_headings[firstKey] === "Overview and purpose of the system") {
-            toast.success('Note: Using sample headings. Set OPENAI_API_KEY environment variable for AI-generated headings.');
+            toast.success('Note: Using sample headings. Gemini API is configured for AI-generated headings.');
           }
         }
         
@@ -418,7 +425,7 @@ const SRSHeadingsEditor = () => {
           console.log('aiGeneratedHeadings keys:', Object.keys(aiGeneratedHeadings || {}));
         }, 100);
       } else {
-        throw new Error('Failed to generate OpenAI headings');
+        throw new Error('Failed to generate Gemini headings');
       }
       
     } catch (error) {
@@ -794,10 +801,28 @@ const SRSHeadingsEditor = () => {
       `merged_${heading}`,
       `standard_${heading}`,
       `ai_${heading}`,
+      `ai_${heading.replace(/[^a-zA-Z0-9]/g, '_')}`, // AI-generated headings use sanitized keys
       // Also check for category-level prompts
       `category_${heading}`,
       `ai_category_${heading}`
     ];
+
+    // Add AI-generated heading keys (handle nested paths)
+    Object.entries(aiGeneratedHeadings).forEach((entry) => {
+      const addAiKeys = (data, parentPath = '') => {
+        Object.entries(data).forEach(([aiHeading, value]) => {
+          const path = parentPath ? `${parentPath} > ${aiHeading}` : aiHeading;
+          if (path === heading || aiHeading === heading) {
+            const aiKey = `ai_${path.replace(/[^a-zA-Z0-9]/g, '_')}`;
+            possibleKeys.push(aiKey);
+          }
+          if (typeof value === 'object' && value !== null) {
+            addAiKeys(value, path);
+          }
+        });
+      };
+      addAiKeys(entry[1] || {});
+    });
 
     // Check for standard headings with category prefix (standard_category_heading format)
     Object.entries(standardHeadings).forEach(([category, categoryHeadings]) => {
@@ -907,6 +932,9 @@ const SRSHeadingsEditor = () => {
         }),
       });
       if (response.ok) {
+        // Extract document ID from response headers
+        const documentId = response.headers.get('X-Document-ID');
+
         const blob = await response.blob();
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -916,7 +944,14 @@ const SRSHeadingsEditor = () => {
         a.click();
         window.URL.revokeObjectURL(url);
         document.body.removeChild(a);
-        toast.success('SRS generated successfully using OpenAI with meeting summaries!');
+
+        // Store document ID and show diagram manager
+        if (documentId) {
+          setGeneratedDocumentId(documentId);
+          setShowDiagramManager(true);
+        }
+
+        toast.success('SRS generated successfully! Check below for diagram customization options.');
       } else {
         throw new Error('Failed to generate SRS');
       }
@@ -1117,20 +1152,48 @@ const SRSHeadingsEditor = () => {
   const renderAiHeadings = (data, selected, onToggle, parentPath = '') => {
     return Object.entries(data).map(([heading, value]) => {
       const path = parentPath ? `${parentPath} > ${heading}` : heading;
+      const headingKey = `ai_${path.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
       if (typeof value === 'string') {
-        // Leaf node
+        // Leaf node - add + button like predefined headings
         return (
-          <div key={path} className="flex items-start space-x-3 p-3 rounded-lg border border-gray-200 hover:bg-gray-50">
-            <input
-              type="checkbox"
-              checked={!!selected[path]}
-              onChange={() => onToggle(path)}
-              className="mt-1 h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
-            />
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-medium text-gray-900">{heading}</div>
-              <div className="text-xs text-gray-500 mt-1">{value}</div>
+          <div key={path}>
+            <div className="flex items-start space-x-3 p-3 rounded-lg border border-gray-200 hover:bg-gray-50">
+              <input
+                type="checkbox"
+                checked={!!selected[path]}
+                onChange={() => onToggle(path)}
+                className="mt-1 h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+              />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-medium text-gray-900">{heading}</div>
+                  <button
+                    onClick={() => togglePromptBox(headingKey)}
+                    className="ml-2 p-2 text-blue-800 hover:text-blue-900 hover:bg-blue-50 rounded-full transition-colors"
+                    title="Add custom prompt for this section"
+                  >
+                    <PlusIcon className="w-5 h-5" />
+                  </button>
+                </div>
+                <div className="text-xs text-gray-500 mt-1">{value}</div>
+              </div>
             </div>
+            {/* Custom Prompt Box for AI-Generated Headings */}
+            {showPromptBox[headingKey] && (
+              <div className="ml-6 mb-2">
+                <textarea
+                  value={headingCustomPrompts[headingKey] || ''}
+                  onChange={(e) => updateCustomPrompt(headingKey, e.target.value)}
+                  placeholder={`Enter custom instructions for "${heading}" (e.g., "Give me 10 functional requirements in bullet points")`}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+                  rows="3"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  This prompt will be applied specifically to the "{heading}" section
+                </p>
+              </div>
+            )}
           </div>
         );
       } else if (typeof value === 'object' && value !== null) {
@@ -1296,7 +1359,7 @@ const SRSHeadingsEditor = () => {
           {documentData.extractedTextContent && Object.keys(documentData.extractedTextContent).length > 0 && (
             <div className="mb-4 p-3 bg-blue-50 rounded-lg">
               <p className="text-sm text-blue-800">
-                📄 Available files for OpenAI processing: {Object.keys(documentData.extractedTextContent).length} files
+                📄 Selected files for processing: {Object.keys(documentData.extractedTextContent).length} files
               </p>
               <p className="text-xs text-blue-600 mt-1">
                 Files: {Object.keys(documentData.extractedTextContent).map(key => documentData.extractedTextContent[key].file_name).join(', ')}
@@ -1447,7 +1510,7 @@ const SRSHeadingsEditor = () => {
         <div className="bg-white rounded-lg shadow-md p-6 mb-8">
           <h2 className="text-xl font-semibold text-gray-800 mb-4 flex items-center">
             <PlusIcon className="w-5 h-5 mr-2" />
-            ✏️ Your Custom Sections
+            Your Custom Sections
           </h2>
           <p className="text-sm text-gray-600 mb-4">
             Create personalized sections with subheadings tailored to your specific project requirements
@@ -1515,7 +1578,7 @@ const SRSHeadingsEditor = () => {
                             <div className="flex items-center space-x-2">
                               <button
                                 onClick={() => togglePromptBox(headingKey)}
-                                className="p-1 text-orange-600 hover:text-orange-800 hover:bg-orange-50 rounded-full transition-colors"
+                                className="p-1 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-full transition-colors"
                                 title="Add custom prompt for this custom section"
                               >
                                 <PlusIcon className="w-4 h-4" />
@@ -1546,7 +1609,7 @@ const SRSHeadingsEditor = () => {
                           value={headingCustomPrompts[headingKey] || ''}
                           onChange={(e) => updateCustomPrompt(headingKey, e.target.value)}
                           placeholder={`Enter custom instructions for "${section.title}" (e.g., "Give me 10 functional requirements in bullet points")`}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-sm"
+                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
                           rows="3"
                         />
                         <p className="text-xs text-gray-500 mt-1">
@@ -1685,6 +1748,18 @@ const SRSHeadingsEditor = () => {
             </button>
           </div>
         </div>
+
+        {/* Diagram Manager - Show after successful SRS generation */}
+        {showDiagramManager && generatedDocumentId && (
+          <div className="mt-8">
+            <DiagramManager
+              documentId={generatedDocumentId}
+              generatedDocumentPath={`generated_docs/generated_srs_${generatedDocumentId}.docx`}
+            />
+          </div>
+        )}
+
+
       </div>
     </div>
   );

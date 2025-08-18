@@ -5,45 +5,1795 @@ Generates DOCX documents from selected headings and their content
 """
 
 from docx import Document
-from docx.shared import Inches, Pt
+from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml.shared import OxmlElement, qn
 import os
+import subprocess
+import tempfile
+import json
+from datetime import datetime
 from typing import List, Dict, Any
-import openai
-from openai import OpenAI
+import google.generativeai as genai
+import re
+import hashlib
+
+# Global variable to store generated diagrams for the current document
+current_document_diagrams = []
+
+# Global counter to limit total diagrams per document (maximum 3)
+total_diagrams_generated = 0
+
+# Global set to track diagram signatures and prevent duplicates
+generated_diagram_signatures = set()
+# Global list to track tokenized signatures for similarity detection
+generated_diagram_token_signatures = []
+
+# Global set to track diagram signatures and prevent duplicates
+generated_diagram_signatures = set()
+
+def reset_diagram_counter():
+    """Reset the global diagram counter for a new document"""
+    global total_diagrams_generated, generated_diagram_signatures
+    total_diagrams_generated = 0
+    generated_diagram_signatures.clear()
+    print("🔄 Reset diagram counter and signatures for new document")
+
+# Define sections that should have diagrams
+DIAGRAM_SECTIONS = {
+    'sequence diagram': 'sequenceDiagram',
+    'system architecture': 'flowchart',
+    'architecture': 'flowchart',
+    'system design': 'flowchart',
+    'data flow': 'flowchart',
+    'workflow': 'flowchart',
+    'process flow': 'flowchart',
+    'user interface': 'flowchart',
+    'database design': 'erDiagram',
+    'data model': 'erDiagram',
+    'entity relationship': 'erDiagram',
+    'class diagram': 'classDiagram',
+    'component diagram': 'flowchart',
+    'deployment': 'flowchart',
+    'network': 'flowchart'
+}
+
+def should_generate_diagram(heading: str, user_prompt: str = "") -> str:
+    """
+    Check if a heading should have a diagram and return the diagram type
+    Returns diagram type if should generate, None otherwise
+    """
+    # First check hardcoded section names
+    heading_lower = heading.lower()
+    for keyword, diagram_type in DIAGRAM_SECTIONS.items():
+        if keyword in heading_lower:
+            return diagram_type
+
+    # If user prompt contains diagram-related keywords, detect diagram type from prompt
+    if user_prompt and user_prompt.strip():
+        prompt_lower = user_prompt.lower()
+
+        # Check for diagram type keywords in user prompt (order matters - more specific first)
+        if any(keyword in prompt_lower for keyword in ['sequence diagram', 'sequence', 'interaction']):
+            return 'sequenceDiagram'
+        elif any(keyword in prompt_lower for keyword in ['flowchart', 'architecture', 'system design', 'workflow', 'process', 'flow']):
+            return 'flowchart'
+        elif any(keyword in prompt_lower for keyword in ['er diagram', 'entity relationship', 'database schema', 'database design']):
+            return 'erDiagram'
+        elif any(keyword in prompt_lower for keyword in ['class diagram', 'uml', 'classes']):
+            return 'classDiagram'
+        elif 'diagram' in prompt_lower:
+            # Default to flowchart if user mentions "diagram" but doesn't specify type
+            return 'flowchart'
+
+    return None
+
+def fix_mermaid_syntax(mermaid_code: str) -> str:
+    """
+    Bulletproof post-processing cleanup for Gemini's Mermaid output
+    Ensures mmdc CLI compatibility even when Gemini breaks rules
+    """
+    if not mermaid_code:
+        return mermaid_code
+
+    import re
+
+    print(f"🔧 Applying bulletproof Mermaid cleanup...")
+
+    # Step 1: Basic cleanup
+    mermaid_code = mermaid_code.replace('\r\n', '\n').replace('\r', '\n').strip()
+
+    # Step 2: Critical fixes (based on your analysis)
+
+    # Fix 1: Remove ALL single quotes and replace with double quotes
+    mermaid_code = re.sub(r"subgraph\s+'([^']+)'", r'subgraph "\1"', mermaid_code)
+    mermaid_code = mermaid_code.replace("'", '"')  # Replace any remaining single quotes
+
+    # Fix 1.1: Remove/normalize HTML and special tags that mmdc cannot parse
+    # Replace <br>, <br/>, <br /> with a space; strip any other HTML tags; normalize ampersands
+    mermaid_code = re.sub(r'<br\s*/?>', ' ', mermaid_code, flags=re.IGNORECASE)
+    mermaid_code = re.sub(r'<[^>]+>', ' ', mermaid_code)  # strip any remaining tags
+    mermaid_code = mermaid_code.replace('&', 'and')
+
+    # Fix 1.2: Handle problematic characters in node labels
+    # Replace parentheses in node labels with spaces or remove them
+    mermaid_code = re.sub(r'\[([^\]]*)\(([^)]*)\)([^\]]*)\]', r'[\1 \2 \3]', mermaid_code)
+    # Remove forward slashes that can cause issues
+    mermaid_code = re.sub(r'\[([^\]]*)/([^\]]*)\]', r'[\1 or \2]', mermaid_code)
+
+    # Fix 2: Ensure newline after subgraph declarations (handle concatenation)
+    # Pattern: subgraph "Name"A[Node] -> subgraph "Name"\n    A[Node]
+    mermaid_code = re.sub(r'(subgraph\s+"[^"]+")([A-Za-z0-9])', r'\1\n    \2', mermaid_code)
+    mermaid_code = re.sub(r'(subgraph\s+[A-Za-z0-9_]+)([A-Za-z0-9])', r'\1\n    \2', mermaid_code)
+
+    # Fix 3: Separate concatenated nodes completely
+    # Pattern: ][NodeID[ -> ]\n    NodeID[
+    mermaid_code = re.sub(r'\]([A-Za-z0-9_]+)\[', r']\n    \1[', mermaid_code)
+
+    # Step 3: Line-by-line processing for final cleanup
+    lines = mermaid_code.split('\n')
+    cleaned_lines = []
+    diagram_type = None
+    in_subgraph = False
+
+    for line in lines:
+        line = line.strip()
+
+        if not line:
+            continue
+
+        # Detect diagram type
+        if line.startswith(('flowchart', 'graph', 'sequenceDiagram', 'erDiagram', 'classDiagram')):
+            if line.startswith('graph'):
+                line = line.replace('graph', 'flowchart')
+                diagram_type = 'flowchart'
+            else:
+                diagram_type = line.split()[0]
+            cleaned_lines.append(line)
+            continue
+
+        # Track subgraph state
+        if line.startswith('subgraph'):
+            in_subgraph = True
+            # Ensure proper quoting for subgraph names
+            if not ('"' in line):
+                # Extract name and add quotes
+                parts = line.split(' ', 1)
+                if len(parts) > 1:
+                    name = parts[1].strip().replace('_', ' ')
+                    line = f'subgraph "{name}"'
+            cleaned_lines.append(line)
+            continue
+        elif line == 'end':
+            in_subgraph = False
+            cleaned_lines.append(line)
+            continue
+
+        # Fix arrows based on diagram type
+        if diagram_type == 'flowchart':
+            # Convert ALL arrow variants to --> (your recommendation)
+            line = re.sub(r'([A-Za-z0-9_]+)\s*-+>\s*([A-Za-z0-9_]+)', r'\1 --> \2', line)
+
+            # Ensure proper indentation in subgraphs
+            if in_subgraph and not line.startswith('    '):
+                line = '    ' + line
+
+        elif diagram_type == 'sequenceDiagram':
+            # Fix sequence diagram syntax issues
+
+            # Fix 1: Handle malformed comma syntax like "Customer,Restaurant,CanarySystem: Call"
+            if ',' in line and ':' in line and not line.startswith('participant'):
+                # This is a malformed message line with commas
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    message = parts[1].strip()
+                    participant_part = parts[0].strip()
+
+                    if ',' in participant_part:
+                        # Extract participants from comma-separated list
+                        participants = [p.strip() for p in participant_part.split(',')]
+                        if len(participants) >= 2:
+                            # Create proper sequence message
+                            line = f'    {participants[0]}->>+{participants[1]}: {message}'
+                        else:
+                            # Fallback to single participant
+                            line = f'    {participants[0]}->>System: {message}'
+
+            # Fix 2: Handle multiple participants declared with commas
+            elif line.startswith('participant') and ',' in line:
+                # Split multiple participants and create separate declarations
+                participants_text = line.replace('participant', '').strip()
+                participants = [p.strip() for p in participants_text.split(',')]
+                # Skip this line, we'll add proper participant declarations later
+                # For now, just clean it up
+                if participants:
+                    line = f'    participant {participants[0]}'
+
+            # Fix 3: Remove any remaining commas from sequence diagrams
+            elif ',' in line:
+                line = line.replace(',', '')
+
+            # Fix 4: Ensure proper sequence arrow syntax
+            if '->' in line and not ('->>' in line or '-->' in line):
+                line = line.replace('->', '->>')
+
+        # Remove semicolons at end of lines
+        if line.endswith(';'):
+            line = line[:-1]
+
+        cleaned_lines.append(line)
+
+    result = '\n'.join(cleaned_lines)
+
+    # Final cleanup
+    result = re.sub(r'\n\s*\n\s*\n', '\n\n', result)  # Remove excessive newlines
+    result = result.strip()
+
+    print(f"🔧 Cleanup complete. Length: {len(mermaid_code)} -> {len(result)}")
+
+    return result
+
+
+def fix_mermaid_with_gemini(broken_code: str, error_message: str) -> str:
+    """
+    Ask Gemini to fix its own broken Mermaid code based on the error message
+    """
+    try:
+        import google.generativeai as genai
+
+        genai.configure(api_key="AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ")
+        model = genai.GenerativeModel('gemini-2.0-flash')
+
+        prompt = f"""
+        You generated this Mermaid code that has syntax errors:
+
+        BROKEN CODE:
+        {broken_code}
+
+        ERROR MESSAGE:
+        {error_message}
+
+        CRITICAL ISSUE: The error shows broken text like "Cal" followed by "l Flow" on separate lines.
+        This means the subgraph name got split incorrectly.
+
+        SPECIFIC FIXES NEEDED:
+        1. If you see broken text like "Cal" and "l Flow", combine them into "Call Flow"
+        2. Subgraph names must be complete and properly quoted: subgraph "Call Flow"
+        3. All content inside subgraphs must be indented with 4 spaces
+        4. Each node must be on its own line
+        5. Use --> for flowcharts (double arrows)
+        6. Never use single quotes anywhere
+
+        EXAMPLE OF CORRECT FORMAT:
+        flowchart LR
+            subgraph "Call Flow"
+                A[Customer] --> B[Phone Number]
+                B --> C[Conference]
+            end
+
+        Return ONLY the corrected Mermaid code, nothing else:
+        """
+
+        print(f"🔧 Asking Gemini to fix its own syntax errors...")
+        response = model.generate_content(prompt)
+
+        if response and response.text:
+            fixed_code = response.text.strip()
+            # Remove any markdown code blocks
+            if fixed_code.startswith('```'):
+                lines = fixed_code.split('\n')
+                fixed_code = '\n'.join(lines[1:-1]) if len(lines) > 2 else fixed_code
+
+            print(f"✅ Gemini provided syntax fix")
+            return fixed_code
+        else:
+            print(f"❌ Gemini failed to provide fix")
+            return broken_code
+
+    except Exception as e:
+        print(f"❌ Error asking Gemini for fix: {e}")
+        return broken_code
+
+
+def analyze_diagram_complexity(mermaid_code: str) -> dict:
+    """
+    Analyze if a Mermaid diagram is too complex for A4 page
+    Returns analysis with suggestions for improvement
+    """
+    import re
+
+    analysis = {
+        'is_too_complex': False,
+        'node_count': 0,
+        'subgraph_count': 0,
+        'connection_count': 0,
+        'suggestions': []
+    }
+
+    if not mermaid_code:
+        return analysis
+
+    # Count nodes
+    nodes = re.findall(r'([A-Za-z0-9_]+)\[([^\]]+)\]', mermaid_code)
+    analysis['node_count'] = len(nodes)
+
+    # Count subgraphs
+    subgraphs = re.findall(r'subgraph\s+', mermaid_code)
+    analysis['subgraph_count'] = len(subgraphs)
+
+    # Count connections
+    connections = re.findall(r'-->', mermaid_code)
+    connections.extend(re.findall(r'->>', mermaid_code))
+    analysis['connection_count'] = len(connections)
+
+    # STRICT A4 COMPATIBILITY CHECKS
+    # A4 portrait: 8.27" x 11.69" - diagrams must fit comfortably
+    if analysis['node_count'] > 6:  # Reduced from 8 to 6
+        analysis['is_too_complex'] = True
+        analysis['suggestions'].append(f"Too many nodes ({analysis['node_count']}). Limit to 4-6 nodes per diagram for A4 compatibility.")
+
+    if analysis['subgraph_count'] > 2:  # Reduced from 3 to 2
+        analysis['is_too_complex'] = True
+        analysis['suggestions'].append(f"Too many subgraphs ({analysis['subgraph_count']}). Limit to 1-2 subgraphs per diagram.")
+
+    if analysis['connection_count'] > 8:  # Reduced from 12 to 8
+        analysis['is_too_complex'] = True
+        analysis['suggestions'].append(f"Too many connections ({analysis['connection_count']}). Simplify the flow to 6-8 connections maximum.")
+
+    # Check for long node labels that make diagrams hard to read on A4
+    long_labels = [label for _, label in nodes if len(label) > 15]  # Reduced from 20 to 15
+    if long_labels:
+        analysis['is_too_complex'] = True
+        analysis['suggestions'].append("Some node labels are too long. Use 2-3 words maximum for A4 readability.")
+
+            # Check for sequence diagram complexity
+        if 'sequencediagram' in mermaid_code.lower():
+            participant_count = len(re.findall(r'participant\s+', mermaid_code))
+            if participant_count > 4:  # Limit sequence diagrams to 4 participants
+                analysis['is_too_complex'] = True
+                analysis['suggestions'].append(f"Too many participants ({participant_count}). Limit to 3-4 participants for A4 compatibility.")
+
+            # Check sequence diagram message complexity
+            message_count = len(re.findall(r'->>|-->>', mermaid_code))
+            if message_count > 6:  # Limit messages for A4 compatibility
+                analysis['is_too_complex'] = True
+                analysis['suggestions'].append(f"Too many messages ({message_count}). Limit to 4-6 messages for A4 compatibility.")
+
+    # Check for ER diagram complexity
+    if 'erdiagram' in mermaid_code.lower():
+        entity_count = len(re.findall(r'[A-Z_]+ \|\|', mermaid_code))
+        if entity_count > 3:  # Limit ER diagrams to 3 entities
+            analysis['is_too_complex'] = True
+            analysis['suggestions'].append(f"Too many entities ({entity_count}). Limit to 2-3 entities for A4 compatibility.")
+
+    return analysis
+
+
+def generate_compact_diagram_prompt(heading: str, content: str, analysis: dict = None) -> str:
+    """
+    Generate a prompt specifically for compact A4-friendly diagrams
+    """
+    base_prompt = f"""
+    Create a COMPACT Mermaid diagram for "{heading}" that fits perfectly on an A4 portrait page.
+
+    CONTENT CONTEXT:
+    {content[:1000]}...
+
+    STRICT SIZE REQUIREMENTS:
+    - Maximum 6-8 nodes total
+    - Maximum 2-3 subgraphs
+    - Use concise labels (3-4 words max)
+    - Prefer vertical layout (TD direction)
+    - Focus on CORE components only
+
+    If the system is complex, create a HIGH-LEVEL overview diagram showing only the most important components.
+    Do NOT try to include every detail - prioritize clarity and readability on A4 page.
+    """
+
+# --- Coverage helpers -------------------------------------------------------
+
+def extract_components_from_text(text: str) -> list:
+    """Extract likely system components from SRS text for coverage analysis."""
+    import re
+    tokens = set()
+    if not text:
+        return []
+    t = text
+    # Common domain/system words and technologies
+    patterns = [
+        r"\b(API Gateway|Auth Service|Authentication Service|Authorization Service|Notification Service)\b",
+        r"\b(Microservice|Service|Module|Component|Subsystem|Worker|Scheduler)\b",
+        r"\b(Database|DB|PostgreSQL|MySQL|MongoDB|Redis|Kafka|Queue|Broker)\b",
+        r"\b(Frontend|Web App|Mobile App|Client|Backend|Server)\b",
+        r"\b(Logging|Monitoring|Tracing|Metrics|Observability)\b",
+        r"\b(ETL|Ingestion|Processing|Analytics|Reporting)\b",
+        r"\b(Identity Provider|IdP|SSO|OAuth|OIDC)\b"
+    ]
+    for p in patterns:
+        for m in re.findall(p, t, flags=re.IGNORECASE):
+            tokens.add(m.strip())
+    # Capitalized multi-word terms
+    for m in re.findall(r"\b([A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+){0,3})\b", t):
+        if len(m) > 2 and not m.isupper():
+            tokens.add(m.strip())
+    return list(tokens)[:30]
+
+
+def extract_names_from_mermaid(code: str) -> list:
+    """Extract participant/node/subgraph names from Mermaid code."""
+    import re
+    parts = set()
+    if not code:
+        return []
+    parts.update(re.findall(r'^\s*participant\s+"?([A-Za-z0-9 _-]+)"?', code, flags=re.MULTILINE))
+    parts.update(re.findall(r'\[([^\]]+)\]', code))
+    parts.update(re.findall(r'subgraph\s+"([^"]+)"', code))
+    cleaned = []
+    for p in parts:
+        x = re.sub(r'[^A-Za-z0-9 ]+', ' ', p).strip()
+        if x and len(x) > 1:
+            cleaned.append(x)
+    return cleaned[:30]
+
+
+    if analysis and analysis.get('suggestions'):
+        base_prompt += f"\n\nPREVIOUS ISSUES TO AVOID:\n" + "\n".join(f"- {s}" for s in analysis['suggestions'])
+
+    return base_prompt
+
+
+def generate_sub_diagrams(heading: str, content: str, diagram_type: str, model, original_diagram: str) -> list:
+    """
+    Generate multiple focused sub-diagrams using AI analysis - completely AI-driven approach
+    """
+    try:
+        print(f"🔄 Using AI to break complex diagram into unique sub-diagrams...")
+
+        # AI-driven validation and planning for necessary diagrams only
+        # Also ensure coverage of the WHOLE system by focusing on components not covered in the original diagram
+        def _extract_names_from_mermaid(code: str) -> list:
+            import re
+            parts = set()
+            parts.update(re.findall(r'^\s*participant\s+"?([A-Za-z0-9 _-]+)"?', code, flags=re.MULTILINE))
+            parts.update(re.findall(r'\[([^\]]+)\]', code))
+            parts.update(re.findall(r'subgraph\s+"([^"]+)"', code))
+            cleaned = []
+            for p in parts:
+                t = re.sub(r'[^A-Za-z0-9 ]+', ' ', p).strip()
+                if t and len(t) > 1:
+                    cleaned.append(t)
+            return cleaned[:20]
+
+        covered_components = _extract_names_from_mermaid(original_diagram)
+
+        validation_prompt = f"""
+        Analyze this system content and determine if it actually needs to be split into sub-diagrams.
+
+        SYSTEM HEADING: {heading}
+        DIAGRAM TYPE: {diagram_type}
+        SYSTEM CONTENT: {content[:1200]}
+        ORIGINAL DIAGRAM (ALREADY COVERED COMPONENTS): {', '.join(covered_components)}
+
+        GOAL:
+        - Ensure the entire SRS/system is covered across the main diagram + sub-diagrams
+        - Sub-diagrams must focus on components/flows NOT covered in the original diagram
+
+        VALIDATION REQUIREMENTS:
+        1. Only suggest sub-diagrams if the system is genuinely complex and has distinct aspects
+        2. Don't add unnecessary diagrams - validate if splitting is actually beneficial
+        3. Maximum 2 sub-diagrams (not 3) - only if truly needed
+        4. Each diagram must be based on actual SRS content, not generic assumptions
+        5. Avoid duplicate or similar diagrams
+
+        Your task:
+        - First determine: Does this system actually need sub-diagrams? (YES/NO)
+        - If YES, create 1-2 unique sub-diagram plans based on actual SRS content
+        - Ensure the plans primarily cover UN-COVERED components/flows (not in: {', '.join(covered_components)})
+        - If NO, return empty array
+
+        Return ONLY a JSON response like this:
+        {{
+            "needs_sub_diagrams": true/false,
+            "reason": "Brief explanation why sub-diagrams are/aren't needed",
+            "sub_diagrams": [
+                {{
+                    "focus_area": "Actual system aspect from SRS content",
+                    "required_components": ["ActualComponent1", "ActualComponent2"],
+                    "forbidden_components": ["ActualComponent3", "ActualComponent4"],
+                    "specific_instructions": "Instructions based on actual SRS content"
+                }}
+            ]
+        }}
+
+        CRITICAL: Only generate diagrams that are actually needed and based on real SRS content.
+        """
+
+        try:
+            validation_response = model.generate_content(validation_prompt)
+            if validation_response and validation_response.text:
+                import json
+                import re
+
+                # Extract JSON from response
+                json_text = validation_response.text.strip()
+                json_text = re.sub(r'```json\s*', '', json_text)
+                json_text = re.sub(r'```\s*$', '', json_text)
+
+                try:
+                    validation_result = json.loads(json_text)
+                    needs_sub_diagrams = validation_result.get('needs_sub_diagrams', False)
+                    reason = validation_result.get('reason', 'No reason provided')
+
+                    print(f"🔍 AI validation: Needs sub-diagrams = {needs_sub_diagrams}")
+                    print(f"📝 Reason: {reason}")
+
+                    if needs_sub_diagrams:
+                        sub_diagram_plan = validation_result.get('sub_diagrams', [])
+                        print(f"✅ AI generated {len(sub_diagram_plan)} necessary sub-diagram plans")
+                    else:
+                        print("✅ AI determined sub-diagrams are not necessary - using original diagram")
+                        return []  # No sub-diagrams needed
+
+                except json.JSONDecodeError:
+                    print("⚠️ AI validation response was not valid JSON, checking if sub-diagrams are needed")
+                    # Simple fallback validation
+                    if len(content) < 500:
+                        print("✅ Content is simple, no sub-diagrams needed")
+                        return []
+                    else:
+                        print("⚠️ Using minimal fallback sub-diagrams")
+                        sub_diagram_plan = [
+                            {
+                                "focus_area": "Core System Flow",
+                                "required_components": ["Main", "Process"],
+                                "forbidden_components": ["External"],
+                                "specific_instructions": "Show core system interactions only"
+                            }
+                        ]
+            else:
+                print("⚠️ No AI validation response, checking content complexity")
+                if len(content) < 500:
+                    print("✅ Content is simple, no sub-diagrams needed")
+                    return []
+                else:
+                    print("⚠️ Using minimal fallback")
+                    sub_diagram_plan = [
+                        {
+                            "focus_area": "Core System Flow",
+                            "required_components": ["Main", "Process"],
+                            "forbidden_components": ["External"],
+                            "specific_instructions": "Show core system interactions only"
+                        }
+                    ]
+        except Exception as e:
+            print(f"⚠️ AI validation failed: {e}, checking content complexity")
+            if len(content) < 500:
+                print("✅ Content is simple, no sub-diagrams needed")
+                return []
+            else:
+                print("⚠️ Using minimal fallback")
+                sub_diagram_plan = [
+                    {
+                        "focus_area": "Core System Flow",
+                        "required_components": ["Main", "Process"],
+                        "forbidden_components": ["External"],
+                        "specific_instructions": "Show core system interactions only"
+                    }
+                ]
+
+        def enhanced_signature_for(code: str) -> str:
+            """SOLUTION: Enhanced signature that detects flow patterns, not just labels"""
+            import re
+            code = code.lower()
+
+            # Extract all components
+            labels = re.findall(r'\[([^\]]+)\]', code)
+            subgraphs = re.findall(r'subgraph\s+"([^"]+)"', code)
+            participants = re.findall(r'^\s*participant\s+"?([A-Za-z0-9 _-]+)"?', code, flags=re.MULTILINE)
+
+            # Extract flow patterns (more sophisticated)
+            edges = re.findall(r'([a-z0-9_]+)\s*-+>+\s*([a-z0-9_]+)', code)
+            sequence_flows = re.findall(r'([a-z0-9_]+)->>([a-z0-9_]+)', code)
+
+            # Create comprehensive signature
+            tokens = set()
+
+            # Add normalized component names
+            for s in labels + subgraphs + participants:
+                t = re.sub(r'[^a-z0-9 ]+', ' ', s)
+                t = re.sub(r'\s+', ' ', t).strip()
+                if t and len(t) > 1:
+                    tokens.add(f"comp:{t}")
+
+            # Add flow patterns with direction
+            for a, b in edges + sequence_flows:
+                tokens.add(f"flow:{a}->{b}")
+
+            # Add structural patterns
+            if 'sequencediagram' in code:
+                tokens.add("type:sequence")
+                # Count interaction patterns
+                interactions = len(re.findall(r'->>|-->', code))
+                tokens.add(f"interactions:{interactions}")
+            elif 'flowchart' in code:
+                tokens.add("type:flowchart")
+                # Count node patterns
+                nodes = len(re.findall(r'\[[^\]]+\]', code))
+                tokens.add(f"nodes:{nodes}")
+
+            # Add complexity indicators
+            if len(edges) > 5:
+                tokens.add("complex:high")
+            elif len(edges) > 2:
+                tokens.add("complex:medium")
+            else:
+                tokens.add("complex:low")
+
+            return '|'.join(sorted(tokens))
+
+        seen_signatures = set()
+        sub_diagrams = []
+
+        for i, sub_plan in enumerate(sub_diagram_plan, 1):
+            focus_area = sub_plan.get('focus_area', f'Sub-diagram {i}')
+            required_components = sub_plan.get('required_components', [])
+            forbidden_components = sub_plan.get('forbidden_components', [])
+            specific_instructions = sub_plan.get('specific_instructions', '')
+
+            # AI-driven prompt with forced differentiation and STRICT A4 requirements
+            sub_prompt = f"""
+            Generate a Mermaid {diagram_type} for this SPECIFIC system aspect:
+
+            SYSTEM: {heading}
+            FOCUS AREA: {focus_area}
+
+            SYSTEM CONTEXT:
+            {content[:800]}
+
+            AI-GENERATED COMPONENT REQUIREMENTS:
+            MUST USE ONLY: {', '.join(required_components)}
+            ABSOLUTELY FORBIDDEN: {', '.join(forbidden_components)}
+
+            AI-GENERATED INSTRUCTIONS:
+            {specific_instructions}
+
+            STRICT A4 COMPATIBILITY REQUIREMENTS:
+            1. Diagram MUST fit on A4 portrait page (8.27" x 11.69")
+            2. Maximum 4-6 nodes/participants ONLY
+            3. Maximum 1-2 subgraphs ONLY
+            4. Maximum 6-8 connections ONLY
+            5. Node labels must be 2-3 words maximum
+            6. Use vertical layout (TD direction) for better A4 fit
+            7. Focus on CORE components only, not every detail
+
+            STRICT ENFORCEMENT RULES:
+            1. You MUST use ONLY the components listed in "MUST USE ONLY"
+            2. You are ABSOLUTELY FORBIDDEN from using any components in "ABSOLUTELY FORBIDDEN"
+            3. If you use any forbidden components, the diagram will be rejected
+            4. Each diagram must show completely different participants/nodes
+            5. Each diagram must show completely different flow patterns
+            6. PRIORITIZE A4 COMPATIBILITY over completeness
+
+            DIAGRAM REQUIREMENTS:
+            - Generate Mermaid diagrams for the given SRS sections
+            - Each diagram must be compact enough to fit within a single A4 portrait page and must be readable (not blurry)
+            - Each sub-diagram must be unique (no repetition of the same diagram text or flow)
+            - Do not add headings, titles, or duplicate captions outside the diagrams
+            - Use short labels (max 2–3 words) for each node
+            - Keep the style minimal, clean, and hierarchical so that the diagrams are clear when rendered in DOCX/PDF
+            - Maximum 4-6 nodes/participants only
+            - Use {diagram_type} format
+            - This is part {i} of {len(sub_diagram_plan)} - must show COMPLETELY DIFFERENT components/flows than other parts
+
+            VALIDATION CHECK:
+            Before generating, verify:
+            - Are you using ONLY the required components?
+            - Are you avoiding ALL forbidden components?
+            - Is this flow pattern different from typical generic flows?
+
+            CRITICAL MERMAID SYNTAX RULES:
+            1. Never use single quotes anywhere
+            2. For subgraphs with spaces: subgraph "Name"
+            3. Use --> for flowcharts, ->> for sequence diagrams
+            4. Keep node labels short and clean
+            5. No semicolons, commas, or special characters in labels
+
+            Return ONLY the Mermaid code for this single diagram (no code blocks, no multiple diagrams):
+            """
+
+            try:
+                response = model.generate_content(sub_prompt)
+                if response and response.text:
+                    sub_code = response.text.strip()
+                    if sub_code.startswith('```'):
+                        lines = sub_code.split('\n')
+                        sub_code = '\n'.join(lines[1:-1]) if len(lines) > 2 else sub_code
+
+                    # Apply syntax fixes
+                    sub_code = fix_mermaid_syntax(sub_code)
+
+                    # SOLUTION: Validate single diagram per response
+                    diagram_count = sub_code.lower().count('sequencediagram') + sub_code.lower().count('flowchart') + sub_code.lower().count('erdiagram') + sub_code.lower().count('classdiagram')
+                    if diagram_count > 1:
+                        print(f"⚠️ Sub-diagram {i} contains multiple diagrams ({diagram_count}), extracting first one only")
+                        # Extract only the first diagram
+                        lines = sub_code.split('\n')
+                        first_diagram_lines = []
+                        diagram_started = False
+                        for line in lines:
+                            if any(keyword in line.lower() for keyword in ['sequencediagram', 'flowchart', 'erdiagram', 'classdiagram']):
+                                if diagram_started:
+                                    break  # Stop at second diagram
+                                diagram_started = True
+                            if diagram_started:
+                                first_diagram_lines.append(line)
+                        sub_code = '\n'.join(first_diagram_lines)
+                        print(f"✅ Extracted single diagram from response")
+
+                    # Check for duplicate diagrams using enhanced signature
+                    diagram_signature = enhanced_signature_for(sub_code)
+                    if diagram_signature in seen_signatures:
+                        print(f"⚠️ Sub-diagram {i} is duplicate (signature: {diagram_signature[:50]}...), skipping")
+                        continue
+
+                    # Additional check: if signature is too similar to existing ones (>80% overlap)
+                    for existing_sig in seen_signatures:
+                        existing_tokens = set(existing_sig.split('|'))
+                        new_tokens = set(diagram_signature.split('|'))
+                        if existing_tokens and new_tokens:
+                            overlap = len(existing_tokens.intersection(new_tokens)) / len(existing_tokens.union(new_tokens))
+                            if overlap > 0.8:
+                                print(f"⚠️ Sub-diagram {i} is too similar to existing diagram ({overlap:.1%} overlap), skipping")
+                                continue
+
+                    # Verify this sub-diagram is actually simpler and A4 compatible
+                    sub_complexity = analyze_diagram_complexity(sub_code)
+                    if not sub_complexity['is_too_complex']:
+                        # Add signature to seen set to prevent future duplicates
+                        seen_signatures.add(diagram_signature)
+                        sub_diagrams.append({
+                            'title': f"{heading} - Part {i}: {focus_area}",
+                            'mermaid_code': sub_code,
+                            'focus_area': focus_area,
+                            'part_number': i
+                        })
+                        print(f"✅ Generated sub-diagram {i}: {focus_area} ({sub_complexity['node_count']} nodes)")
+                        print(f"📝 Diagram signature: {diagram_signature[:50]}...")
+                    else:
+                        print(f"⚠️ Sub-diagram {i} still too complex for A4, skipping")
+                        print(f"📋 Issues: {', '.join(sub_complexity['suggestions'])}")
+
+            except Exception as sub_error:
+                print(f"❌ Failed to generate sub-diagram {i}: {sub_error}")
+
+        # If we have fewer than 2 unique sub-diagrams, the original was probably not that complex
+        if len(sub_diagrams) < 2:
+            print(f"⚠️ Only generated {len(sub_diagrams)} unique sub-diagrams, original diagram may not be too complex")
+            return []
+
+        return sub_diagrams
+
+    except Exception as e:
+        print(f"❌ Error generating sub-diagrams: {e}")
+        return []
+
+
+def insert_sub_diagrams_into_document(doc: Document, heading: str, sub_diagrams: list):
+    """
+    Insert multiple sub-diagrams into the document for a complex section
+    """
+    try:
+        print(f"📄 Inserting {len(sub_diagrams)} sub-diagrams for: {heading}")
+
+        # Find the section in the document
+        target_paragraph = None
+        for para in doc.paragraphs:
+            if heading.lower() in para.text.lower() and para.style.name == 'SRS Heading 2':
+                target_paragraph = para
+                break
+
+        if not target_paragraph:
+            print(f"⚠️ Could not find section '{heading}' in document")
+            return
+
+        # Insert each sub-diagram without subheadings
+        for i, sub_diagram in enumerate(sub_diagrams):
+            # Generate PNG for this sub-diagram (no titles or descriptions)
+            sub_diagram_filename = f"{heading.replace(' ', '_')}_Part_{sub_diagram['part_number']}_diagram.png"
+            sub_diagram_path = os.path.join(os.path.dirname(__file__), '..', 'temp_diagrams', sub_diagram_filename)
+
+            # Ensure sub-diagram code is properly cleaned before conversion
+            cleaned_sub_code = fix_mermaid_syntax(sub_diagram['mermaid_code'])
+
+            # Convert to PNG
+            if convert_mermaid_to_png_with_fallback(cleaned_sub_code, sub_diagram_path, sub_diagram['title']):
+                # Insert the PNG
+                diagram_para = doc.add_paragraph()
+                run = diagram_para.runs[0] if diagram_para.runs else diagram_para.add_run()
+                run.add_picture(sub_diagram_path, width=Inches(6))
+                diagram_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                print(f"✅ Inserted sub-diagram {i+1}: {sub_diagram['title']}")
+            else:
+                # Skip failed diagrams (no placeholder text since we don't want subheadings)
+                print(f"❌ Failed to generate PNG for sub-diagram {i+1}, skipping")
+
+        print(f"📄 Completed inserting {len(sub_diagrams)} sub-diagrams")
+
+    except Exception as e:
+        print(f"❌ Error inserting sub-diagrams: {e}")
+
+
+def convert_mermaid_to_png_with_error_capture(mermaid_code: str, output_path: str) -> tuple[bool, str]:
+    """
+    Convert Mermaid to PNG and capture error messages for Gemini correction
+    Returns: (success: bool, error_message: str)
+    """
+    try:
+        mmdc_cmd = find_mmdc_command()
+        if not mmdc_cmd:
+            return False, "mmdc command not found"
+
+        # Create temporary file for mermaid code
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.mmd', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(mermaid_code)
+            temp_mmd_path = temp_file.name
+
+        print(f"📝 Temp Mermaid file: {temp_mmd_path}")
+        print(f"📋 Mermaid code preview: {mermaid_code[:100]}...")
+
+        # Build command for PNG
+        if mmdc_cmd.startswith('npx'):
+            cmd = mmdc_cmd.split() + [
+                '-i', temp_mmd_path,
+                '-o', output_path,
+                '-b', 'white',
+            ]
+        else:
+            cmd = [
+                mmdc_cmd,
+                '-i', temp_mmd_path,
+                '-o', output_path,
+                '-b', 'white',
+            ]
+
+        print(f"🚀 Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        # Clean up temporary file
+        if temp_mmd_path and os.path.exists(temp_mmd_path):
+            os.unlink(temp_mmd_path)
+
+        print(f"📊 Command exit code: {result.returncode}")
+        if result.stdout:
+            print(f"📤 stdout: {result.stdout}")
+        if result.stderr:
+            print(f"📥 stderr: {result.stderr}")
+
+        if result.returncode == 0:
+            if os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
+                print(f"✅ Successfully generated PNG: {output_path} ({file_size} bytes)")
+                return True, ""
+            else:
+                return False, "PNG file was not created"
+        else:
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            print(f"❌ mmdc command failed with exit code {result.returncode}")
+            print(f"   Error details: {error_msg}")
+            return False, error_msg
+
+    except subprocess.TimeoutExpired:
+        error_msg = "mmdc command timed out"
+        print(f"⏰ {error_msg}")
+        return False, error_msg
+    except Exception as e:
+        error_msg = f"Exception during PNG conversion: {str(e)}"
+        print(f"❌ {error_msg}")
+        return False, error_msg
+
+
+def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str = "", user_prompt: str = "", full_srs_content: str = "") -> str:
+    """
+    Generate Mermaid diagram code using Gemini AI based on the heading and content
+    Maximum 3 unique diagrams total per document with strict A4 compatibility
+    """
+    try:
+        global total_diagrams_generated, generated_diagram_signatures
+
+        # Check if we've already generated maximum diagrams
+        if total_diagrams_generated >= 3:
+            print(f"⚠️ Maximum 3 diagrams already generated, skipping diagram for: {heading}")
+            return None
+
+        print(f"🎨 Attempting to generate diagram {total_diagrams_generated + 1}/3 for: {heading}")
+
+        # Configure Gemini API with error handling
+        try:
+            genai.configure(api_key="AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ")
+            model = genai.GenerativeModel('gemini-2.0-flash')
+            print("✅ Gemini API configured successfully")
+        except Exception as config_error:
+            print(f"❌ Failed to configure Gemini API: {config_error}")
+            return None
+
+        diagram_type = should_generate_diagram(heading, user_prompt)
+        print(f"📊 Diagram type for '{heading}': {diagram_type}")
+
+        if not diagram_type:
+            print(f"⚠️ No diagram type found for heading: {heading}")
+            return None
+
+        # ENHANCED PROMPT WITH STRICT A4 REQUIREMENTS
+        if user_prompt and user_prompt.strip():
+            # Process user prompt to ensure professional SRS language
+            professional_prompt = user_prompt.replace("according to meeting summary", "based on system requirements")
+            professional_prompt = professional_prompt.replace("meeting transcript", "system specifications")
+            professional_prompt = professional_prompt.replace("meeting", "requirements analysis")
+
+            prompt = f"""
+            PROFESSIONAL SRS DIAGRAM REQUIREMENTS:
+            {professional_prompt}
+
+            SECTION HEADING: {heading}
+            SECTION CONTENT: {content}
+            SYSTEM CONTEXT: {uploaded_content if uploaded_content else "No additional context"}
+
+            FULL SRS DOCUMENT CONTEXT:
+            {full_srs_content if full_srs_content else "No full SRS context available"}
+
+            DIAGRAM TYPE TO GENERATE: {diagram_type}
+
+            CRITICAL A4 COMPATIBILITY REQUIREMENTS:
+            1. Diagram MUST fit on A4 portrait page (8.27" x 11.69")
+            2. Maximum 4-6 nodes/participants ONLY
+            3. Maximum 1-2 subgraphs ONLY
+            4. Maximum 6-8 connections ONLY
+            5. Node labels must be 2-3 words maximum
+            6. Use vertical layout (TD direction) for better A4 fit
+            7. Focus on CORE components only, not every detail
+
+            INSTRUCTIONS:
+            - Base the diagram on the COMPLETE system described in the full SRS document
+            - Show overall system architecture, workflows, and component interactions
+            - Include all major components mentioned across the entire SRS
+            - Focus on the big picture rather than just this section
+            - PRIORITIZE A4 COMPATIBILITY over completeness
+
+            TECHNICAL REQUIREMENTS:
+            1. Return ONLY one single Mermaid diagram (no multiple diagrams, no code blocks)
+            2. Use proper Mermaid {diagram_type} syntax
+            3. CRITICAL: Avoid parentheses, commas, periods, and special characters in node labels
+            4. Use simple node names like [Frontend], [Backend], [Database], [User], [API]
+            5. Keep node text short and clean
+            6. For ER diagrams: CRITICAL - Keep it VERY simple with max 3 entities only
+            7. For ER diagrams: Use only basic data types (int, string, date) - NO complex types
+            8. For ER diagrams: Use simple entity names like USER, ORDER, PRODUCT (no spaces or special chars)
+            9. For ER diagrams: Maximum 3-4 fields per entity to ensure compatibility
+
+            CRITICAL MERMAID SYNTAX RULES (MUST FOLLOW EXACTLY):
+            1. Never use single quotes in any part of the Mermaid code.
+            2. For subgraphs: If the name has spaces, wrap it in double quotes "Name".
+            3. After subgraph declaration, always start a new line before listing nodes.
+            4. Indent all nodes inside a subgraph with exactly 4 spaces.
+            5. Each node definition must be on its own separate line.
+            6. For flowcharts, use --> (double hyphen and angle bracket) for all connections.
+            7. Never use ->, --, or other arrow variants.
+            8. Avoid parentheses, commas, periods, or special characters in node IDs and labels.
+            9. No semicolons after diagram type declarations.
+            10. For sequence diagrams: NO COMMAS anywhere in the code.
+            11. For sequence diagrams: Each participant must be declared separately.
+            12. For sequence diagrams: Use ->> for messages, -->> for responses.
+            13. Keep diagram code clean and minimal so mmdc can parse it.
+
+            A4 COMPATIBILITY ENFORCEMENT:
+            14. Generate compact, unique diagrams that fit within one A4 portrait page
+            15. Avoid repetition of diagrams and flows - each diagram must be completely unique
+            16. If a diagram is too large, break it into multiple smaller sub-diagrams with different flows
+            17. Ensure sub-diagrams are unique and represent different system aspects
+            18. Do not add headings, titles, or duplicate captions outside the diagrams
+            19. Use short labels (max 2–3 words) for each node
+            20. Keep the style minimal, clean, and hierarchical for clear rendering in DOCX/PDF
+            21. Maximum 4-6 nodes/participants per diagram for A4 compatibility
+            22. Maintain clear diagram hierarchy with no duplicate node names across diagrams
+            23. Return ONLY one single Mermaid diagram (no multiple diagrams in one response)
+
+            CORRECT MERMAID SYNTAX EXAMPLES FOR A4:
+
+            For flowchart (COMPACT):
+            flowchart TD
+                A[Start] --> B[Process]
+                B --> C[End]
+
+            For flowchart with subgraphs (A4 COMPATIBLE):
+            flowchart TD
+                subgraph "Core System"
+                    A[User Input]
+                    B[Process]
+                end
+                A --> B --> C[Output]
+
+            For sequenceDiagram (A4 COMPATIBLE):
+            sequenceDiagram
+                participant User
+                participant System
+                User->>System: Request
+                System-->>User: Response
+
+            For erDiagram (A4 COMPATIBLE):
+            erDiagram
+                USER ||--o{{ ORDER : places
+
+            Generate the Mermaid diagram code based on the COMPLETE SRS system:
+            """
+        else:
+            prompt = f"""
+            Generate a Mermaid diagram for the complete system described in the SRS document.
+
+            SECTION HEADING: {heading}
+            SECTION CONTENT: {content}
+            MEETING CONTEXT: {uploaded_content if uploaded_content else "No additional context"}
+
+            FULL SRS DOCUMENT CONTEXT:
+            {full_srs_content if full_srs_content else "No full SRS context available"}
+
+            DIAGRAM TYPE: {diagram_type}
+
+            CRITICAL A4 COMPATIBILITY REQUIREMENTS:
+            1. Diagram MUST fit on A4 portrait page (8.27" x 11.69")
+            2. Maximum 4-6 nodes/participants ONLY
+            3. Maximum 1-2 subgraphs ONLY
+            4. Maximum 6-8 connections ONLY
+            5. Node labels must be 2-3 words maximum
+            6. Use vertical layout (TD direction) for better A4 fit
+            7. Focus on CORE components only, not every detail
+
+            REQUIREMENTS:
+            1. Create a professional {diagram_type} diagram showing the COMPLETE system architecture
+            2. Base the diagram on the ENTIRE SRS document, not just this section
+            3. Show all major components, their relationships, and interactions
+            4. Include system workflows and data flows from the complete SRS
+            5. Use clear, descriptive labels for all system components
+            6. Return ONLY one single Mermaid diagram (no multiple diagrams, no code blocks)
+            7. CRITICAL: Avoid parentheses, commas, periods, and special characters in node labels
+            8. Use simple node names like [Frontend], [Backend], [Database], [User], [API], [Cache]
+            9. Keep node text short and clean
+            10. For ER diagrams: CRITICAL - Keep it VERY simple with max 3 entities only
+            11. For ER diagrams: Use only basic data types (int, string, date) - NO complex types
+            12. For ER diagrams: Use simple entity names like USER, ORDER, PRODUCT (no spaces or special chars)
+            13. For ER diagrams: Maximum 3-4 fields per entity to ensure compatibility
+
+            CRITICAL MERMAID SYNTAX RULES (MUST FOLLOW EXACTLY):
+            1. Never use single quotes in any part of the Mermaid code.
+            2. For subgraphs: If the name has spaces, wrap it in double quotes "Name".
+            3. After subgraph declaration, always start a new line before listing nodes.
+            4. Indent all nodes inside a subgraph with exactly 4 spaces.
+            5. Each node definition must be on its own separate line.
+            6. For flowcharts, use --> (double hyphen and angle bracket) for all connections.
+            7. Never use ->, --, or other arrow variants.
+            8. Avoid parentheses, commas, periods, or special characters in node IDs and labels.
+            9. No semicolons after diagram type declarations.
+            10. For sequence diagrams: NO COMMAS anywhere in the code.
+            11. For sequence diagrams: Each participant must be declared separately.
+            12. For sequence diagrams: Use ->> for messages, -->> for responses.
+            13. Keep diagram code clean and minimal so mmdc can parse it.
+
+            A4 COMPATIBILITY ENFORCEMENT:
+            14. Generate compact, unique diagrams that fit within one A4 portrait page
+            15. Avoid repetition of diagrams and flows - each diagram must be completely unique
+            16. If a diagram is too large, break it into multiple smaller sub-diagrams with different flows
+            17. Ensure sub-diagrams are unique and represent different system aspects
+            18. Do not add headings, titles, or duplicate captions outside the diagrams
+            19. Use short labels (max 2–3 words) for each node
+            20. Keep the style minimal, clean, and hierarchical for clear rendering in DOCX/PDF
+            21. Maximum 4-6 nodes/participants per diagram for A4 compatibility
+            22. Maintain clear diagram hierarchy with no duplicate node names across diagrams
+            23. Return ONLY one single Mermaid diagram (no multiple diagrams in one response)
+
+            CORRECT MERMAID SYNTAX EXAMPLES FOR A4:
+
+            For flowchart (COMPACT):
+            flowchart TD
+                A[Start] --> B[Process]
+                B --> C[End]
+
+            For flowchart with subgraphs (A4 COMPATIBLE):
+            flowchart TD
+                subgraph "Core System"
+                    A[User Input]
+                    B[Process]
+                end
+                A --> B --> C[Output]
+
+            For sequenceDiagram (A4 COMPATIBLE):
+            sequenceDiagram
+                participant User
+                participant System
+                User->>System: Request
+                System-->>User: Response
+
+            For erDiagram (A4 COMPATIBLE):
+            erDiagram
+                USER ||--o{{ ORDER : places
+
+            Generate the Mermaid diagram code representing the complete system:
+            """
+
+        print(f"📤 Sending diagram prompt to Gemini for '{heading}'...")
+        response = model.generate_content(prompt)
+
+        if response and response.text:
+            mermaid_code = response.text.strip()
+
+            # Clean the mermaid code - remove markdown code fences if present
+            if mermaid_code.startswith('```mermaid'):
+                # Remove opening ```mermaid
+                mermaid_code = mermaid_code[10:].strip()
+            elif mermaid_code.startswith('```'):
+                # Remove opening ```
+                mermaid_code = mermaid_code[3:].strip()
+
+            if mermaid_code.endswith('```'):
+                # Remove closing ```
+                mermaid_code = mermaid_code[:-3].strip()
+
+            # SOLUTION: Validate single diagram per response
+            diagram_count = mermaid_code.lower().count('sequencediagram') + mermaid_code.lower().count('flowchart') + mermaid_code.lower().count('erdiagram') + mermaid_code.lower().count('classdiagram')
+            if diagram_count > 1:
+                print(f"⚠️ Main diagram contains multiple diagrams ({diagram_count}), extracting first one only")
+                # Extract only the first diagram
+                lines = mermaid_code.split('\n')
+                first_diagram_lines = []
+                diagram_started = False
+                for line in lines:
+                    if any(keyword in line.lower() for keyword in ['sequencediagram', 'flowchart', 'erdiagram', 'classdiagram']):
+                        if diagram_started:
+                            break  # Stop at second diagram
+                        diagram_started = True
+                    if diagram_started:
+                        first_diagram_lines.append(line)
+                mermaid_code = '\n'.join(first_diagram_lines)
+                print(f"✅ Extracted single diagram from main response")
+
+            # Apply syntax fixes
+            print(f"🔧 Applying syntax fixes to diagram...")
+            fixed_mermaid_code = fix_mermaid_syntax(mermaid_code)
+
+            # VALIDATE DIAGRAM FOR A4 COMPATIBILITY
+            is_valid, error_msg, complexity = validate_diagram_for_a4(fixed_mermaid_code, heading)
+            if not is_valid:
+                print(f"⚠️ Diagram validation failed for '{heading}': {error_msg}")
+
+                # Try to clean up the diagram for A4 compatibility
+                print(f"🔧 Attempting to clean up diagram for A4 compatibility...")
+                cleaned_mermaid_code = cleanup_diagram_for_a4(fixed_mermaid_code)
+
+                # Re-validate the cleaned diagram
+                is_valid_cleaned, error_msg_cleaned, complexity_cleaned = validate_diagram_for_a4(cleaned_mermaid_code, heading)
+                if is_valid_cleaned:
+                    print(f"✅ Diagram cleaned successfully for A4 compatibility")
+                    fixed_mermaid_code = cleaned_mermaid_code
+                    complexity = complexity_cleaned
+                else:
+                    print(f"❌ Diagram still not A4 compatible after cleanup: {error_msg_cleaned}")
+                    return None
+            else:
+                print(f"✅ Diagram passed A4 compatibility validation")
+
+            print(f"📊 Diagram complexity: {complexity['node_count']} nodes, {complexity['subgraph_count']} subgraphs")
+
+            # Only generate sub-diagrams if the original is actually too complex
+            if complexity['is_too_complex']:
+                print(f"⚠️ Diagram too complex for A4 page, generating sub-diagrams...")
+                print(f"📋 Issues: {', '.join(complexity['suggestions'])}")
+
+                # Generate multiple focused sub-diagrams
+                sub_diagrams = generate_sub_diagrams(heading, content, diagram_type, model, fixed_mermaid_code)
+
+                if sub_diagrams and len(sub_diagrams) > 1:
+                    print(f"✅ Generated {len(sub_diagrams)} sub-diagrams for better A4 fit")
+
+                    # Store all sub-diagrams in the global list
+                    global current_document_diagrams
+                    for sub_diagram in sub_diagrams:
+                        current_document_diagrams.append({
+                            'id': f"{heading.replace(' ', '_')}_{sub_diagram['part_number']}_{len(current_document_diagrams)}",
+                            'sectionTitle': sub_diagram['title'],
+                            'diagramType': diagram_type,
+                            'mermaidCode': sub_diagram['mermaid_code'],
+                            'theme': 'default',
+                            'lastModified': datetime.now().isoformat(),
+                            'isSubDiagram': True,
+                            'parentSection': heading,
+                            'focusArea': sub_diagram['focus_area']
+                        })
+
+                    # Use the first sub-diagram as the main one
+                    fixed_mermaid_code = sub_diagrams[0]['mermaid_code']
+                    print(f"📊 Using sub-diagram 1 as main: {sub_diagrams[0]['title']}")
+                else:
+                    print(f"⚠️ Could not break into sub-diagrams, using original")
+            else:
+                print(f"✅ Diagram is A4-compatible ({complexity['node_count']} nodes) - no sub-diagrams needed")
+
+            # ADD DIAGRAM SIGNATURE TO PREVENT FUTURE DUPLICATES
+            diagram_signature = generate_diagram_signature(fixed_mermaid_code, heading)
+            generated_diagram_signatures.add(diagram_signature)
+            print(f"📝 Added diagram signature: {diagram_signature}")
+
+            # Increment global diagram counter
+            total_diagrams_generated += 1
+
+            print(f"✅ Generated Mermaid diagram {total_diagrams_generated}/3 for: {heading}")
+            print(f"📋 Original code preview: {mermaid_code[:100]}...")
+            print(f"📋 Fixed code preview: {fixed_mermaid_code[:100]}...")
+            return fixed_mermaid_code
+        else:
+            print(f"⚠️ Empty diagram response from Gemini for '{heading}'")
+            return None
+
+    except Exception as e:
+        print(f"❌ Error generating Mermaid diagram for {heading}: {str(e)}")
+        print(f"🔍 Error type: {type(e).__name__}")
+
+        # Provide more specific error messages
+        if "API_KEY_INVALID" in str(e):
+            print(f"💡 Invalid Gemini API key for diagram generation")
+        elif "PERMISSION_DENIED" in str(e):
+            print(f"💡 Permission denied for Gemini API")
+        elif "QUOTA_EXCEEDED" in str(e):
+            print(f"💡 Gemini API quota exceeded")
+
+        return None
+
+def find_mmdc_command():
+    """Find the mmdc command path on different systems"""
+    possible_commands = [
+        'mmdc',  # Direct command
+        'mmdc.cmd',  # Windows batch file
+        'npx mmdc',  # Using npx
+    ]
+
+    # Also check common npm global paths
+    import platform
+    if platform.system() == "Windows":
+        # Common Windows npm global paths
+        possible_paths = [
+            os.path.expanduser("~\\AppData\\Roaming\\npm\\mmdc.cmd"),
+            os.path.expanduser("~\\AppData\\Roaming\\npm\\mmdc"),
+            "C:\\Users\\%USERNAME%\\AppData\\Roaming\\npm\\mmdc.cmd",
+        ]
+        possible_commands.extend(possible_paths)
+
+    for cmd in possible_commands:
+        try:
+            if cmd.startswith('npx'):
+                # For npx commands, split them
+                cmd_parts = cmd.split()
+                result = subprocess.run(cmd_parts + ['--version'], capture_output=True, text=True, timeout=10)
+            else:
+                result = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=10)
+
+            if result.returncode == 0:
+                print(f"✅ Found mmdc at: {cmd}")
+                return cmd
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+            continue
+
+    return None
+
+def check_mermaid_cli_installed() -> bool:
+    """Check if mermaid-cli (mmdc) is installed"""
+    return find_mmdc_command() is not None
+
+def diagnose_mermaid_cli_issues():
+    """
+    Diagnose common Mermaid CLI installation and configuration issues
+    """
+    print("🔍 Diagnosing Mermaid CLI issues...")
+
+    # Check if Node.js is installed
+    try:
+        result = subprocess.run(['node', '--version'], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            print(f"✅ Node.js is installed: {result.stdout.strip()}")
+        else:
+            print("❌ Node.js is not installed or not working")
+            print("💡 Install Node.js from: https://nodejs.org/")
+            return
+    except Exception:
+        print("❌ Node.js is not installed or not accessible")
+        print("💡 Install Node.js from: https://nodejs.org/")
+        return
+
+    # Check if npm is working
+    try:
+        result = subprocess.run(['npm', '--version'], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            print(f"✅ npm is working: {result.stdout.strip()}")
+        else:
+            print("❌ npm is not working properly")
+            return
+    except Exception:
+        print("❌ npm is not accessible")
+        return
+
+    # Check if mmdc is installed
+    mmdc_cmd = find_mmdc_command()
+    if mmdc_cmd:
+        print(f"✅ Found mmdc at: {mmdc_cmd}")
+
+        # Test mmdc with a simple diagram
+        test_mermaid = "graph TD\n    A[Start] --> B[End]"
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.mmd', delete=False) as temp_file:
+                temp_file.write(test_mermaid)
+                temp_mmd_path = temp_file.name
+
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_png:
+                temp_png_path = temp_png.name
+
+            if mmdc_cmd.startswith('npx'):
+                cmd = mmdc_cmd.split() + ['-i', temp_mmd_path, '-o', temp_png_path]
+            else:
+                cmd = [mmdc_cmd, '-i', temp_mmd_path, '-o', temp_png_path]
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+            # Cleanup
+            if os.path.exists(temp_mmd_path):
+                os.unlink(temp_mmd_path)
+            if os.path.exists(temp_png_path):
+                os.unlink(temp_png_path)
+
+            if result.returncode == 0:
+                print("✅ mmdc is working correctly")
+            else:
+                print(f"❌ mmdc test failed: {result.stderr}")
+                print("💡 Try reinstalling: npm install -g @mermaid-js/mermaid-cli")
+
+        except Exception as e:
+            print(f"❌ mmdc test error: {e}")
+    else:
+        print("❌ mmdc (Mermaid CLI) is not installed")
+        print("💡 Install with: npm install -g @mermaid-js/mermaid-cli")
+        print("💡 On Windows, you may need to restart your terminal after installation")
+        print("💡 Alternative: Use npx @mermaid-js/mermaid-cli instead of global installation")
+
+def convert_mermaid_to_svg(mermaid_code: str, output_path: str) -> bool:
+    """
+    Convert Mermaid code to SVG image using mermaid-cli (mmdc)
+    SVG is vector-based and stays sharp at any zoom level
+    Returns True if successful, False otherwise
+    """
+    try:
+        # Find the mmdc command
+        mmdc_cmd = find_mmdc_command()
+        if not mmdc_cmd:
+            print("❌ mermaid-cli (mmdc) not found.")
+            print("💡 To install: npm install -g @mermaid-js/mermaid-cli")
+            print("💡 Alternative: Install Node.js first, then run the npm command")
+            print("💡 On Windows, you might need to restart your terminal after installation")
+            return False
+
+        # Create temporary file for mermaid code
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.mmd', delete=False) as temp_file:
+            temp_file.write(mermaid_code)
+            temp_mmd_path = temp_file.name
+
+        print(f"🔧 Using mmdc command: {mmdc_cmd}")
+        print(f"📝 Temp mermaid file: {temp_mmd_path}")
+        print(f"🎯 Output path: {output_path}")
+
+        # Build command based on whether it's npx or direct
+        # For SVG, we don't need width/height since it's vector-based
+        if mmdc_cmd.startswith('npx'):
+            cmd = mmdc_cmd.split() + [
+                '-i', temp_mmd_path,
+                '-o', output_path,
+                '-b', 'white',  # Background color
+            ]
+        else:
+            cmd = [
+                mmdc_cmd,
+                '-i', temp_mmd_path,
+                '-o', output_path,
+                '-b', 'white',  # Background color
+            ]
+
+        print(f"🚀 Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        # Clean up temporary file
+        if temp_mmd_path and os.path.exists(temp_mmd_path):
+            os.unlink(temp_mmd_path)
+
+        if result.returncode == 0:
+            print(f"✅ Successfully converted Mermaid to SVG: {output_path}")
+            if os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
+                print(f"📊 Generated SVG size: {file_size} bytes")
+                return True
+            else:
+                print(f"❌ Output file was not created: {output_path}")
+                return False
+        else:
+            print(f"❌ Error converting Mermaid to SVG (exit code: {result.returncode}):")
+            print(f"   stdout: {result.stdout}")
+            print(f"   stderr: {result.stderr}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        print("❌ Timeout while converting Mermaid diagram (30s limit exceeded)")
+        # Clean up temp file if it exists
+        try:
+            os.unlink(temp_mmd_path)
+        except:
+            pass
+        return False
+    except Exception as e:
+        print(f"❌ Error converting Mermaid to SVG: {str(e)}")
+        return False
+
+def convert_mermaid_to_png(mermaid_code: str, output_path: str) -> bool:
+    """
+    Convert Mermaid code to PNG image using mermaid-cli (mmdc)
+    This is for document insertion since python-docx doesn't support SVG
+    Returns True if successful, False otherwise
+    """
+    temp_mmd_path = None
+    try:
+        print(f"🔧 Converting Mermaid to PNG: {output_path}")
+
+        # Find the mmdc command
+        mmdc_cmd = find_mmdc_command()
+        if not mmdc_cmd:
+            print("❌ mmdc command not found")
+            return False
+
+        print(f"✅ Using mmdc command: {mmdc_cmd}")
+
+        # Validate Mermaid code first
+        if not mermaid_code or not mermaid_code.strip():
+            print("❌ Empty Mermaid code provided")
+            return False
+
+        # Create temporary file for mermaid code
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.mmd', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(mermaid_code)
+            temp_mmd_path = temp_file.name
+
+        print(f"📝 Temp Mermaid file: {temp_mmd_path}")
+        print(f"📋 Mermaid code preview: {mermaid_code[:100]}...")
+
+        # Build command for PNG with better error handling
+        if mmdc_cmd.startswith('npx'):
+            cmd = mmdc_cmd.split() + [
+                '-i', temp_mmd_path,
+                '-o', output_path,
+                '-b', 'white',
+            ]
+        else:
+            cmd = [
+                mmdc_cmd,
+                '-i', temp_mmd_path,
+                '-o', output_path,
+                '-b', 'white',
+            ]
+
+        print(f"🚀 Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+
+        print(f"📊 Command exit code: {result.returncode}")
+        if result.stdout:
+            print(f"📤 stdout: {result.stdout}")
+        if result.stderr:
+            print(f"📥 stderr: {result.stderr}")
+
+        # Clean up temporary file
+        if temp_mmd_path and os.path.exists(temp_mmd_path):
+            os.unlink(temp_mmd_path)
+
+        if result.returncode == 0:
+            if os.path.exists(output_path):
+                file_size = os.path.getsize(output_path)
+                print(f"✅ Successfully generated PNG: {output_path} ({file_size} bytes)")
+                return True
+            else:
+                print(f"❌ Command succeeded but output file not found: {output_path}")
+                return False
+        else:
+            print(f"❌ mmdc command failed with exit code {result.returncode}")
+            if result.stderr:
+                print(f"   Error details: {result.stderr}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        print("❌ Timeout while converting Mermaid diagram (90s limit exceeded)")
+        return False
+    except Exception as e:
+        print(f"❌ Exception during Mermaid to PNG conversion: {str(e)}")
+        print(f"   Exception type: {type(e).__name__}")
+        return False
+    finally:
+        # Clean up temp file if it exists
+        if temp_mmd_path and os.path.exists(temp_mmd_path):
+            try:
+                os.unlink(temp_mmd_path)
+            except Exception as cleanup_error:
+                print(f"⚠️ Failed to cleanup temp file: {cleanup_error}")
+
+def convert_mermaid_to_png_with_fallback(mermaid_code: str, output_path: str, heading_text: str) -> bool:
+    """
+    Convert Mermaid to PNG with multiple fallback strategies including Gemini self-correction
+    """
+    print(f"🔄 Attempting PNG conversion for: {heading_text}")
+
+    # Strategy 1: Try with current settings
+    success, error_message = convert_mermaid_to_png_with_error_capture(mermaid_code, output_path)
+    if success:
+        return True
+
+    print(f"⚠️ First attempt failed: {error_message}")
+    print(f"🔧 Trying Gemini self-correction...")
+
+    # Strategy 2: Ask Gemini to fix its own syntax errors
+    if error_message:
+        corrected_code = fix_mermaid_with_gemini(mermaid_code, error_message)
+        if corrected_code != mermaid_code:
+            print(f"🔄 Trying with Gemini-corrected code...")
+            success, second_error = convert_mermaid_to_png_with_error_capture(corrected_code, output_path)
+            if success:
+                print(f"✅ Gemini self-correction worked!")
+                return True
+
+            # Strategy 2b: If Gemini correction still fails, try one more time with the new error
+            if second_error and second_error != error_message:
+                print(f"🔧 Gemini correction still failed, trying second correction...")
+                double_corrected_code = fix_mermaid_with_gemini(corrected_code, second_error)
+                if double_corrected_code != corrected_code:
+                    success, _ = convert_mermaid_to_png_with_error_capture(double_corrected_code, output_path)
+                    if success:
+                        print(f"✅ Gemini double-correction worked!")
+                        return True
+
+    print(f"⚠️ Gemini correction failed, trying other fallback strategies...")
+
+    # Strategy 3: Try with simplified command (no extra parameters)
+    temp_mmd_path = None
+    try:
+        mmdc_cmd = find_mmdc_command()
+        if not mmdc_cmd:
+            return False
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.mmd', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(mermaid_code)
+            temp_mmd_path = temp_file.name
+
+        # Simple command without extra parameters
+        if mmdc_cmd.startswith('npx'):
+            cmd = mmdc_cmd.split() + ['-i', temp_mmd_path, '-o', output_path]
+        else:
+            cmd = [mmdc_cmd, '-i', temp_mmd_path, '-o', output_path]
+
+        print(f"🔄 Fallback attempt with simplified command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+        if temp_mmd_path and os.path.exists(temp_mmd_path):
+            os.unlink(temp_mmd_path)
+
+        if result.returncode == 0 and os.path.exists(output_path):
+            print(f"✅ Fallback conversion successful!")
+            return True
+
+    except Exception as e:
+        print(f"❌ Fallback strategy failed: {e}")
+        if temp_mmd_path and os.path.exists(temp_mmd_path):
+            try:
+                os.unlink(temp_mmd_path)
+            except:
+                pass
+
+    # Strategy 4: Try to fix common Mermaid syntax issues
+    print(f"🔄 Trying syntax cleanup...")
+    cleaned_code = clean_mermaid_syntax(mermaid_code)
+    if cleaned_code != mermaid_code:
+        print(f"📝 Cleaned Mermaid syntax, retrying...")
+        if convert_mermaid_to_png(cleaned_code, output_path):
+            return True
+
+    print(f"❌ All fallback strategies failed for: {heading_text}")
+    return False
+
+def clean_mermaid_syntax(mermaid_code: str) -> str:
+    """
+    Clean common Mermaid syntax issues that might cause failures
+    """
+    # Just call the main fix function to avoid conflicts
+    return fix_mermaid_syntax(mermaid_code)
+
+def insert_diagram_placeholder(doc: Document, heading_text: str, mermaid_code: str):
+    """
+    Insert a placeholder when diagram generation fails
+    """
+    try:
+        # Add a note about the diagram failure
+        placeholder_para = doc.add_paragraph()
+        placeholder_para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        placeholder_para.paragraph_format.space_before = Pt(12)
+        placeholder_para.paragraph_format.space_after = Pt(12)
+
+        # Add placeholder text
+        run = placeholder_para.add_run("📊 Diagram Generation Failed")
+        run.font.size = Pt(14)
+        run.font.bold = True
+        run.font.color.rgb = RGBColor(255, 0, 0)  # Red color
+
+        # Add explanation
+        explanation_para = doc.add_paragraph(
+            f"A diagram was intended for this section but could not be generated. "
+            f"You can use the Draw.io XML export feature to create the diagram manually.",
+            style='SRS Normal'
+        )
+        explanation_para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        explanation_para.paragraph_format.space_after = Pt(12)
+
+        # Add the Mermaid code for reference
+        code_para = doc.add_paragraph("Mermaid Code Reference:", style='SRS Normal')
+        code_para.paragraph_format.space_before = Pt(6)
+
+        code_content = doc.add_paragraph(mermaid_code[:500] + "..." if len(mermaid_code) > 500 else mermaid_code)
+        code_content.paragraph_format.left_indent = Inches(0.5)
+        code_content.paragraph_format.space_after = Pt(12)
+
+        # Style the code block
+        for run in code_content.runs:
+            run.font.name = 'Courier New'
+            run.font.size = Pt(9)
+
+        print(f"📝 Inserted diagram placeholder for: {heading_text}")
+
+    except Exception as e:
+        print(f"❌ Failed to insert diagram placeholder: {e}")
+
+def insert_diagram_into_document(doc: Document, diagram_path: str, heading_text: str):
+    """
+    Insert diagram image into the document after the specified heading
+    Ensures A4 compatibility with proper sizing
+    """
+    try:
+        if not os.path.exists(diagram_path):
+            print(f"❌ Diagram file not found: {diagram_path}")
+            return
+
+        # Find the heading paragraph and insert diagram after content
+        for i, para in enumerate(doc.paragraphs):
+            if heading_text.lower() in para.text.lower() and para.style.name == 'SRS Heading 2':
+                # Add diagram description
+                diagram_desc = doc.add_paragraph("The following diagram illustrates the system design:", style='SRS Normal')
+                diagram_desc.paragraph_format.left_indent = Inches(0.25)
+                diagram_desc.paragraph_format.space_after = Pt(6)
+
+                # Add the diagram image with A4-optimized sizing
+                diagram_para = doc.add_paragraph()
+                diagram_para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = diagram_para.add_run()
+
+                # A4 OPTIMIZATION: Calculate optimal width for A4 page
+                # A4 width: 8.27 inches, margins: ~1 inch each side, so usable width: ~6.27 inches
+                # Use 6 inches for diagrams to ensure they fit comfortably
+                optimal_width = Inches(6.0)
+
+                run.add_picture(diagram_path, width=optimal_width)
+                diagram_para.paragraph_format.space_after = Pt(12)
+
+                print(f"✅ Inserted A4-optimized diagram for: {heading_text}")
+                break
+
+    except Exception as e:
+        print(f"❌ Error inserting diagram for {heading_text}: {str(e)}")
+
+def insert_diagram_with_a4_optimization(doc: Document, diagram_path: str, heading_text: str, diagram_type: str = "flowchart"):
+    """
+    Insert diagram with A4 page optimization and automatic sizing
+    """
+    try:
+        if not os.path.exists(diagram_path):
+            print(f"❌ Diagram file not found: {diagram_path}")
+            return False
+
+        # Find the heading paragraph
+        target_paragraph = None
+        for para in doc.paragraphs:
+            if heading_text.lower() in para.text.lower() and para.style.name == 'SRS Heading 2':
+                target_paragraph = para
+                break
+
+        if not target_paragraph:
+            print(f"⚠️ Could not find section '{heading_text}' in document")
+            return False
+
+        # Add diagram description
+        diagram_desc = doc.add_paragraph("The following diagram illustrates the system design:", style='SRS Normal')
+        diagram_desc.paragraph_format.left_indent = Inches(0.25)
+        diagram_desc.paragraph_format.space_after = Pt(6)
+
+        # A4 OPTIMIZATION: Smart sizing based on diagram type
+        if diagram_type == "erDiagram":
+            # ER diagrams are typically wider, use smaller width
+            diagram_width = Inches(5.5)
+        elif diagram_type == "sequenceDiagram":
+            # Sequence diagrams can be wider, use medium width
+            diagram_width = Inches(6.0)
+        else:
+            # Flowcharts and others use standard A4 width
+            diagram_width = Inches(6.0)
+
+        # Insert the diagram with optimized sizing
+        diagram_para = doc.add_paragraph()
+        diagram_para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = diagram_para.add_run()
+
+        try:
+            run.add_picture(diagram_path, width=diagram_width)
+            diagram_para.paragraph_format.space_after = Pt(12)
+            print(f"✅ Successfully inserted A4-optimized {diagram_type} diagram into document")
+            print(f"📏 Diagram width: {diagram_width}")
+            return True
+
+        except Exception as png_error:
+            print(f"❌ Failed to insert diagram: {png_error}")
+            return False
+
+    except Exception as e:
+        print(f"❌ Error in A4-optimized diagram insertion: {e}")
+        return False
 
 def generate_srs_docx(headings: List[Dict[str, Any]], output_path: str, uploaded_content: str = ""):
     """
     Generate SRS document in DOCX format from selected headings
-    
+
     Args:
         headings: List of heading dictionaries with 'heading', 'purpose', 'category', 'source'
         output_path: Path where to save the generated DOCX file
         uploaded_content: Content from uploaded PDF documents for context
+
+    Returns:
+        List of generated diagrams with their metadata
     """
+    global current_document_diagrams
+
+    # Reset diagram generation for new document
+    reset_diagram_counter()
+    current_document_diagrams = []  # Reset for new document
+
     try:
         # Create a new document
         doc = Document()
-        
+
         # Set up document styles
         setup_document_styles(doc)
-        
+
         # Add title page
         add_title_page(doc)
-        
+
         # Add table of contents
         add_table_of_contents(doc, headings)
-        
+
         # Add content sections
         add_content_sections(doc, headings, uploaded_content)
-        
+
         # Save the document
         doc.save(output_path)
-        
+
         print(f"✅ SRS document generated successfully: {output_path}")
-        
+
+        # Print diagram generation summary
+        print_diagram_generation_summary()
+
+        # Return the generated diagrams
+        return current_document_diagrams
+
     except Exception as e:
         print(f"❌ Failed to generate SRS document: {str(e)}")
         raise
@@ -59,7 +1809,7 @@ def setup_document_styles(doc: Document):
         title_font.bold = True
         title_style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
         title_style.paragraph_format.space_after = Pt(12)
-        
+
         # Heading 1 style
         h1_style = doc.styles.add_style('SRS Heading 1', WD_STYLE_TYPE.PARAGRAPH)
         h1_font = h1_style.font
@@ -68,7 +1818,7 @@ def setup_document_styles(doc: Document):
         h1_font.bold = True
         h1_style.paragraph_format.space_before = Pt(12)
         h1_style.paragraph_format.space_after = Pt(6)
-        
+
         # Heading 2 style
         h2_style = doc.styles.add_style('SRS Heading 2', WD_STYLE_TYPE.PARAGRAPH)
         h2_font = h2_style.font
@@ -77,14 +1827,23 @@ def setup_document_styles(doc: Document):
         h2_font.bold = True
         h2_style.paragraph_format.space_before = Pt(10)
         h2_style.paragraph_format.space_after = Pt(6)
-        
+
+        # Heading 3 style
+        h3_style = doc.styles.add_style('SRS Heading 3', WD_STYLE_TYPE.PARAGRAPH)
+        h3_font = h3_style.font
+        h3_font.name = 'Arial'
+        h3_font.size = Pt(12)
+        h3_font.bold = True
+        h3_style.paragraph_format.space_before = Pt(8)
+        h3_style.paragraph_format.space_after = Pt(4)
+
         # Normal text style
         normal_style = doc.styles.add_style('SRS Normal', WD_STYLE_TYPE.PARAGRAPH)
         normal_font = normal_style.font
         normal_font.name = 'Arial'
         normal_font.size = Pt(11)
         normal_style.paragraph_format.space_after = Pt(6)
-        
+
     except Exception as e:
         print(f"⚠️ Warning: Could not set up custom styles: {e}")
 
@@ -92,19 +1851,19 @@ def add_title_page(doc: Document):
     """Add title page to the document"""
     # Add title
     title = doc.add_paragraph('Software Requirements Specification', style='SRS Title')
-    
+
     # Add subtitle
     subtitle = doc.add_paragraph('Generated by SRS Dynamic Generator', style='SRS Normal')
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
+
     # Add some spacing
     doc.add_paragraph()
     doc.add_paragraph()
-    
+
     # Add document info
     info_para = doc.add_paragraph('Document Information:', style='SRS Heading 2')
     info_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    
+
     # Add document details
     details = [
         ('Document Type:', 'Software Requirements Specification'),
@@ -112,29 +1871,52 @@ def add_title_page(doc: Document):
         ('Tool:', 'SRS Dynamic Generator'),
         ('Version:', '1.0')
     ]
-    
+
     for label, value in details:
         detail_para = doc.add_paragraph(f'{label} {value}', style='SRS Normal')
-    
+
     # Add page break
     doc.add_page_break()
 
 def add_table_of_contents(doc: Document, headings: List[Dict[str, Any]]):
     """Add table of contents to the document"""
+    print(f"🔍 TOC DEBUG: Received {len(headings)} headings:")
+    for i, heading in enumerate(headings):
+        print(f"   TOC {i+1}. {heading.get('heading', 'No heading')} ({heading.get('category', 'No category')})")
+
+    # DEDUPLICATE HEADINGS - Remove duplicates based on heading name and category
+    seen_headings = set()
+    deduplicated_headings = []
+
+    for heading in headings:
+        heading_key = (heading.get('heading', ''), heading.get('category', ''))
+        if heading_key not in seen_headings:
+            seen_headings.add(heading_key)
+            deduplicated_headings.append(heading)
+        else:
+            print(f"⚠️ TOC: Skipping duplicate heading: {heading.get('heading', '')} ({heading.get('category', '')})")
+
+    print(f"🔧 TOC: Deduplicated {len(headings)} → {len(deduplicated_headings)} headings")
+
     # Add TOC title
     toc_title = doc.add_paragraph('Table of Contents', style='SRS Heading 1')
     toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
+
     # Separate custom sections from other headings
     custom_sections = []
     other_headings = []
-    
-    for heading in headings:
+
+    for heading in deduplicated_headings:
         if heading.get('category') == 'Custom':
             custom_sections.append(heading)
         else:
             other_headings.append(heading)
-    
+
+    print(f"🔍 TOC DEBUG: After separation and deduplication:")
+    print(f"   Custom sections: {len(custom_sections)}")
+    for i, section in enumerate(custom_sections):
+        print(f"      TOC Custom {i+1}: {section.get('heading', 'No heading')}")
+
     # Group non-custom headings by category
     categories = {}
     for heading in other_headings:
@@ -142,44 +1924,73 @@ def add_table_of_contents(doc: Document, headings: List[Dict[str, Any]]):
         if category not in categories:
             categories[category] = []
         categories[category].append(heading)
-    
+
     # Add TOC entries for categorized headings
     for category, category_headings in categories.items():
         # Add category header
         category_para = doc.add_paragraph(category, style='SRS Heading 2')
-        
+
         # Add headings in this category
         for i, heading in enumerate(category_headings, 1):
             heading_text = heading.get('heading', '')
             toc_entry = doc.add_paragraph(f'{i}. {heading_text}', style='SRS Normal')
             toc_entry.paragraph_format.left_indent = Inches(0.5)
-    
+
     # Add custom sections as individual TOC entries (no category grouping)
     if custom_sections:
+        print(f"🔍 TOC: Adding {len(custom_sections)} custom sections to TOC")
+        for i, section in enumerate(custom_sections):
+            print(f"   TOC Custom {i+1}: {section.get('heading', 'No heading')}")
+
         # Add a separator or header for custom sections
         custom_header = doc.add_paragraph('Custom Sections', style='SRS Heading 2')
-        
+
         # Add each custom section as individual entry
         for i, custom_heading in enumerate(custom_sections, 1):
             heading_text = custom_heading.get('heading', '')
+            print(f"📝 TOC: Adding entry {i}. {heading_text}")
             toc_entry = doc.add_paragraph(f'{i}. {heading_text}', style='SRS Normal')
             toc_entry.paragraph_format.left_indent = Inches(0.5)
-    
+
     # Add page break
     doc.add_page_break()
 
 def add_content_sections(doc: Document, headings: List[Dict[str, Any]], uploaded_content: str = ""):
-    """Add content sections for each heading"""
+    """Add content sections for each heading with full SRS context for diagrams"""
+    print(f"🔍 DEBUG: Received {len(headings)} headings:")
+    for i, heading in enumerate(headings):
+        print(f"   {i+1}. {heading.get('heading', 'No heading')} ({heading.get('category', 'No category')})")
+
+    # DEDUPLICATE HEADINGS - Remove duplicates based on heading name and category
+    seen_headings = set()
+    deduplicated_headings = []
+
+    for heading in headings:
+        heading_key = (heading.get('heading', ''), heading.get('category', ''))
+        if heading_key not in seen_headings:
+            seen_headings.add(heading_key)
+            deduplicated_headings.append(heading)
+        else:
+            print(f"⚠️ CONTENT: Skipping duplicate heading: {heading.get('heading', '')} ({heading.get('category', '')})")
+
+    print(f"🔧 CONTENT: Deduplicated {len(headings)} → {len(deduplicated_headings)} headings")
+
     # Separate custom sections from other headings
     custom_sections = []
     other_headings = []
-    
-    for heading in headings:
+
+    for heading in deduplicated_headings:
         if heading.get('category') == 'Custom':
             custom_sections.append(heading)
         else:
             other_headings.append(heading)
-    
+
+    print(f"🔍 DEBUG: After separation and deduplication:")
+    print(f"   Custom sections: {len(custom_sections)}")
+    print(f"   Other headings: {len(other_headings)}")
+    for i, section in enumerate(custom_sections):
+        print(f"      Custom {i+1}: {section.get('heading', 'No heading')}")
+
     # Group non-custom headings by category
     categories = {}
     for heading in other_headings:
@@ -187,43 +1998,228 @@ def add_content_sections(doc: Document, headings: List[Dict[str, Any]], uploaded
         if category not in categories:
             categories[category] = []
         categories[category].append(heading)
-    
+
+    # FIRST PASS: Generate all content without diagrams to build full SRS context
+    print("🔄 First pass: Generating all content for full SRS context...")
+    all_generated_content = []
+    all_headings_for_processing = []
+
+    # Collect all headings in order
+    for category, category_headings in categories.items():
+        for heading in category_headings:
+            all_headings_for_processing.append(heading)
+    for custom_heading in custom_sections:
+        all_headings_for_processing.append(custom_heading)
+
+    # Generate content for all headings first
+    for heading in all_headings_for_processing:
+        heading_text = heading.get('heading', '')
+        purpose = heading.get('purpose', '')
+        source = heading.get('source', 'Unknown')
+        user_prompt = heading.get('userPrompt', '')
+
+        print(f"📝 Pre-generating content for: {heading_text}")
+        generated_content = generate_content_for_heading(
+            heading_text, purpose, source, uploaded_content, user_prompt
+        )
+
+        all_generated_content.append({
+            'heading': heading_text,
+            'content': generated_content,
+            'heading_data': heading
+        })
+
+    # Build full SRS context string
+    full_srs_content = "\n\n".join([
+        f"=== {item['heading']} ===\n{item['content']}"
+        for item in all_generated_content
+    ])
+
+    print(f"📊 Full SRS context built: {len(full_srs_content)} characters")
+
+    # SECOND PASS: Add content to document with full SRS context for diagrams
+    print("🔄 Second pass: Adding pre-generated content to document with diagram generation...")
+
+    # Create a lookup for pre-generated content
+    content_lookup = {item['heading']: item for item in all_generated_content}
+
     # Add content for each category (excluding custom sections)
     for category, category_headings in categories.items():
         # Add category header
         category_para = doc.add_paragraph(category, style='SRS Heading 1')
-        
+
         # Add content for each heading in this category
         for heading in category_headings:
-            add_heading_content(doc, heading, uploaded_content)
-        
+            heading_text = heading.get('heading', '')
+            pre_generated = content_lookup.get(heading_text)
+            if pre_generated:
+                add_heading_content_with_pregenerated(doc, heading, uploaded_content, full_srs_content, pre_generated['content'])
+            else:
+                # Fallback to old method if not found
+                add_heading_content_with_full_context(doc, heading, uploaded_content, full_srs_content)
+
         # Add some spacing between categories
         doc.add_paragraph()
-    
+
     # Add custom sections as individual sections (no category grouping)
+    print(f"🔄 Processing {len(custom_sections)} custom sections...")
     for custom_heading in custom_sections:
-        add_heading_content(doc, custom_heading, uploaded_content)
+        heading_text = custom_heading.get('heading', '')
+        print(f"📝 Processing custom section: {heading_text}")
+        pre_generated = content_lookup.get(heading_text)
+        if pre_generated:
+            print(f"✅ Found pre-generated content for: {heading_text}")
+            add_heading_content_with_pregenerated(doc, custom_heading, uploaded_content, full_srs_content, pre_generated['content'])
+        else:
+            print(f"⚠️ No pre-generated content found for: {heading_text}, using fallback")
+            # Fallback to old method if not found
+            add_heading_content_with_full_context(doc, custom_heading, uploaded_content, full_srs_content)
         # Add spacing between custom sections
         doc.add_paragraph()
 
-def add_heading_content(doc: Document, heading: Dict[str, Any], uploaded_content: str = ""):
-    """Add content for a specific heading"""
+def add_heading_content_with_pregenerated(doc: Document, heading: Dict[str, Any], uploaded_content: str = "", full_srs_content: str = "", pregenerated_content: str = ""):
+    """Add content for a specific heading with diagram generation using pre-generated content"""
+    global current_document_diagrams
+
     heading_text = heading.get('heading', '')
     purpose = heading.get('purpose', '')
     source = heading.get('source', 'Unknown')
     category = heading.get('category', 'Other')
     user_prompt = heading.get('userPrompt', '')
+
     # Add heading
     heading_para = doc.add_paragraph(heading_text, style='SRS Heading 2')
+
     # Add purpose
     if purpose:
         purpose_para = doc.add_paragraph(f'Purpose: {purpose}', style='SRS Normal')
         purpose_para.paragraph_format.left_indent = Inches(0.25)
+
     # Add source information
     source_para = doc.add_paragraph(f'Source: {source}', style='SRS Normal')
     source_para.paragraph_format.left_indent = Inches(0.25)
     source_para.paragraph_format.space_after = Pt(12)
+
+    # Use pre-generated content (no need to call AI again)
+    print(f"📄 Using pre-generated content for: {heading_text}")
+    generated_content = pregenerated_content
+
+    # Add generated content
+    content_para = doc.add_paragraph(generated_content, style='SRS Normal')
+    content_para.paragraph_format.left_indent = Inches(0.25)
+    content_para.paragraph_format.space_after = Pt(12)
+
+    # Check if this section should have a diagram (considering user prompt)
+    diagram_type = should_generate_diagram(heading_text, user_prompt)
+    if diagram_type:
+        print(f"🎨 Generating diagram for section: {heading_text}")
+
+        # Generate Mermaid diagram with custom prompt support and full SRS context
+        mermaid_code = generate_mermaid_diagram(heading_text, generated_content, uploaded_content, user_prompt, full_srs_content)
+
+        # If sequence diagram generation failed, try with a more specific prompt
+        if not mermaid_code and diagram_type == 'sequenceDiagram':
+            print(f"🔄 Sequence diagram generation failed, trying with specialized prompt...")
+            mermaid_code = generate_sequence_diagram_specialized(heading_text, generated_content, uploaded_content, user_prompt, full_srs_content)
+
+        if False and mermaid_code:
+            # Disabled legacy convert/insert path to prevent duplicate insertions
+            pass
+        else:
+            print(f"⚠️ No Mermaid code generated for: {heading_text}")
+
+        if mermaid_code:
+            # Store the generated diagram
+            current_document_diagrams.append({
+                'id': f"{heading_text.replace(' ', '_')}_{len(current_document_diagrams)}",
+                'sectionTitle': heading_text,
+                'diagramType': diagram_type,
+                'mermaidCode': mermaid_code,
+                'theme': 'default',
+                'lastModified': datetime.now().isoformat()
+            })
+            # Create temporary directory for diagrams if it doesn't exist
+            diagrams_dir = os.path.join(os.path.dirname(__file__), '..', 'temp_diagrams')
+            os.makedirs(diagrams_dir, exist_ok=True)
+
+            # Generate unique filename for the diagram
+            safe_heading = "".join(c for c in heading_text if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            safe_heading = safe_heading.replace(' ', '_')
+            diagram_filename = f"{safe_heading}_diagram.svg"
+            diagram_path = os.path.join(diagrams_dir, diagram_filename)
+
+            # Generate high-quality PNG for document insertion with fallback
+            png_path = diagram_path.replace('.svg', '.png')
+            png_success = convert_mermaid_to_png_with_fallback(mermaid_code, png_path, heading_text)
+
+            if png_success:
+                # Use A4-optimized diagram insertion
+                if insert_diagram_with_a4_optimization(doc, png_path, heading_text, diagram_type):
+                    print(f"✅ Successfully processed diagram for: {heading_text}")
+                    print(f"📄 A4-optimized PNG generated and inserted")
+
+                    # Clean up PNG file after insertion
+                    try:
+                        os.remove(png_path)
+                    except:
+                        pass
+                else:
+                    print(f"⚠️ Failed to insert A4-optimized diagram for: {heading_text}")
+
+                # Check if there are sub-diagrams to insert (only if main diagram was complex)
+                sub_diagrams_for_section = [d for d in current_document_diagrams
+                                          if d.get('parentSection') == heading_text and d.get('isSubDiagram')]
+
+                print(f"🔍 DEBUG: Looking for sub-diagrams for '{heading_text}'")
+                print(f"🔍 DEBUG: Found {len(sub_diagrams_for_section)} sub-diagrams")
+                print(f"🔍 DEBUG: Total diagrams in memory: {len(current_document_diagrams)}")
+                for i, diag in enumerate(current_document_diagrams):
+                    print(f"   Diagram {i+1}: {diag.get('sectionTitle')} (parent: {diag.get('parentSection')}, isSubDiagram: {diag.get('isSubDiagram')})")
+
+                if sub_diagrams_for_section:
+                    print(f"📄 Inserting {len(sub_diagrams_for_section)} additional sub-diagrams...")
+                    # Convert the stored sub-diagram data to the format expected by insert function
+                    formatted_sub_diagrams = []
+                    for sub_diag in sub_diagrams_for_section:
+                        formatted_sub_diagrams.append({
+                            'title': sub_diag['sectionTitle'],
+                            'mermaid_code': sub_diag['mermaidCode'],
+                            'focus_area': sub_diag.get('focusArea', 'System Component'),
+                            'part_number': sub_diag.get('id', '').split('_')[-1] if '_' in sub_diag.get('id', '') else '1'
+                        })
+                    insert_sub_diagrams_into_document(doc, heading_text, formatted_sub_diagrams)
+            else:
+                print(f"⚠️ Failed to generate diagram for: {heading_text}")
+                # Insert a placeholder instead of failing silently
+                insert_diagram_placeholder(doc, heading_text, mermaid_code)
+        else:
+            print(f"⚠️ No Mermaid code generated for: {heading_text}")
+
+def add_heading_content_with_full_context(doc: Document, heading: Dict[str, Any], uploaded_content: str = "", full_srs_content: str = ""):
+    """Add content for a specific heading with diagram generation using full SRS context (fallback method)"""
+    global current_document_diagrams
+
+    heading_text = heading.get('heading', '')
+    purpose = heading.get('purpose', '')
+    source = heading.get('source', 'Unknown')
+    category = heading.get('category', 'Other')
+    user_prompt = heading.get('userPrompt', '')
+
+    # Add heading
+    heading_para = doc.add_paragraph(heading_text, style='SRS Heading 2')
+
+    # Add purpose
+    if purpose:
+        purpose_para = doc.add_paragraph(f'Purpose: {purpose}', style='SRS Normal')
+        purpose_para.paragraph_format.left_indent = Inches(0.25)
+
+    # Add source information
+    source_para = doc.add_paragraph(f'Source: {source}', style='SRS Normal')
+    source_para.paragraph_format.left_indent = Inches(0.25)
+    source_para.paragraph_format.space_after = Pt(12)
+
     # Generate content using AI with uploaded document context and user_prompt
+    print(f"📝 Generating content for heading: {heading_text}")
     generated_content = generate_content_for_heading(
         heading_text,
         purpose,
@@ -231,72 +2227,247 @@ def add_heading_content(doc: Document, heading: Dict[str, Any], uploaded_content
         uploaded_content,
         user_prompt
     )
+
     # Add generated content
     content_para = doc.add_paragraph(generated_content, style='SRS Normal')
     content_para.paragraph_format.left_indent = Inches(0.25)
     content_para.paragraph_format.space_after = Pt(12)
 
+    # Check if this section should have a diagram (considering user prompt)
+    diagram_type = should_generate_diagram(heading_text, user_prompt)
+    if diagram_type:
+        print(f"🎨 Generating diagram for section: {heading_text}")
+
+        # Generate Mermaid diagram with custom prompt support and full SRS context
+        mermaid_code = generate_mermaid_diagram(heading_text, generated_content, uploaded_content, user_prompt, full_srs_content)
+
+        # If sequence diagram generation failed, try with a more specific prompt
+        if not mermaid_code and diagram_type == 'sequenceDiagram':
+            print(f"🔄 Sequence diagram generation failed, trying with specialized prompt...")
+            mermaid_code = generate_sequence_diagram_specialized(heading_text, generated_content, uploaded_content, user_prompt, full_srs_content)
+
+        if mermaid_code:
+            # Convert Mermaid to PNG and insert into document
+            # Create proper PNG file path
+            safe_filename = heading_text.replace(' ', '_').replace('/', '_').replace('\\', '_')
+            png_filename = f"{safe_filename}_diagram.png"
+            png_path = os.path.join(os.path.dirname(__file__), '..', 'temp_diagrams', png_filename)
+
+            # Ensure temp_diagrams directory exists
+            os.makedirs(os.path.dirname(png_path), exist_ok=True)
+
+            success = convert_mermaid_to_png(mermaid_code, png_path)
+            if success and os.path.exists(png_path):
+                # Use A4-optimized diagram insertion
+                if insert_diagram_with_a4_optimization(doc, png_path, heading_text, diagram_type):
+                    print(f"✅ Successfully processed diagram for: {heading_text}")
+                    print(f"📄 A4-optimized PNG generated and inserted")
+
+                    # Clean up PNG file after insertion
+                    try:
+                        os.remove(png_path)
+                    except:
+                        pass
+                else:
+                    print(f"⚠️ Failed to insert A4-optimized diagram for: {heading_text}")
+
+                # Check if there are sub-diagrams to insert (only if main diagram was complex)
+                sub_diagrams_for_section = [d for d in current_document_diagrams
+                                          if d.get('parentSection') == heading_text and d.get('isSubDiagram')]
+
+                if sub_diagrams_for_section:
+                    print(f"📄 Inserting {len(sub_diagrams_for_section)} additional sub-diagrams...")
+                    # Convert the stored sub-diagram data to the format expected by insert function
+                    formatted_sub_diagrams = []
+                    for sub_diag in sub_diagrams_for_section:
+                        formatted_sub_diagrams.append({
+                            'title': sub_diag['sectionTitle'],
+                            'mermaid_code': sub_diag['mermaidCode'],
+                            'focus_area': sub_diag.get('focusArea', 'System Component'),
+                            'part_number': sub_diag.get('id', '').split('_')[-1] if '_' in sub_diag.get('id', '') else '1'
+                        })
+                    insert_sub_diagrams_into_document(doc, heading_text, formatted_sub_diagrams)
+            else:
+                print(f"⚠️ Failed to generate diagram for: {heading_text}")
+                # Insert a placeholder instead of failing silently
+                insert_diagram_placeholder(doc, heading_text, mermaid_code)
+        else:
+            print(f"⚠️ No Mermaid code generated for: {heading_text}")
+    else:
+        mermaid_code = None
+
+        if mermaid_code:
+            # Create temporary directory for diagrams if it doesn't exist
+            diagrams_dir = os.path.join(os.path.dirname(__file__), '..', 'temp_diagrams')
+            os.makedirs(diagrams_dir, exist_ok=True)
+
+            # Generate unique filename for the diagram
+            safe_heading = "".join(c for c in heading_text if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            safe_heading = safe_heading.replace(' ', '_')
+            diagram_filename = f"{safe_heading}_diagram.svg"
+            diagram_path = os.path.join(diagrams_dir, diagram_filename)
+
+            # Generate high-quality PNG for document insertion
+            png_path = diagram_path.replace('.svg', '.png')
+            png_success = convert_mermaid_to_png(mermaid_code, png_path)
+
+            if png_success:
+                # Add diagram description
+                diagram_desc = doc.add_paragraph("The following diagram illustrates the system design:", style='SRS Normal')
+                diagram_desc.paragraph_format.left_indent = Inches(0.25)
+                diagram_desc.paragraph_format.space_after = Pt(6)
+
+                # Insert high-quality PNG into document
+                diagram_para = doc.add_paragraph()
+                diagram_para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = diagram_para.add_run()
+
+                try:
+                    run.add_picture(png_path, width=Inches(6))  # Full resolution for clarity
+                    diagram_para.paragraph_format.space_after = Pt(12)
+                    print(f"✅ Successfully inserted high-quality PNG diagram into document")
+
+                    # Clean up PNG file after insertion
+                    try:
+                        os.remove(png_path)
+                    except:
+                        pass
+
+                except Exception as png_error:
+                    print(f"❌ Failed to insert PNG diagram: {png_error}")
+
+                print(f"✅ Successfully processed diagram for: {heading_text}")
+                print(f"📄 High-quality PNG generated and inserted")
+
+                # Check if there are sub-diagrams to insert (only if main diagram was complex)
+                sub_diagrams_for_section = [d for d in current_document_diagrams
+                                          if d.get('parentSection') == heading_text and d.get('isSubDiagram')]
+
+                if sub_diagrams_for_section:
+                    print(f"📄 Inserting {len(sub_diagrams_for_section)} additional sub-diagrams...")
+                    # Convert the stored sub-diagram data to the format expected by insert function
+                    formatted_sub_diagrams = []
+                    for sub_diag in sub_diagrams_for_section:
+                        formatted_sub_diagrams.append({
+                            'title': sub_diag['sectionTitle'],
+                            'mermaid_code': sub_diag['mermaidCode'],
+                            'focus_area': sub_diag.get('focusArea', 'System Component'),
+                            'part_number': sub_diag.get('id', '').split('_')[-1] if '_' in sub_diag.get('id', '') else '1'
+                        })
+                    insert_sub_diagrams_into_document(doc, heading_text, formatted_sub_diagrams)
+            else:
+                print(f"⚠️ Failed to generate diagram for: {heading_text}")
+        else:
+            print(f"⚠️ No Mermaid code generated for: {heading_text}")
+
 def generate_content_for_heading(heading: str, purpose: str, source: str, uploaded_content: str = "", user_prompt: str = "") -> str:
     """
-    Generate content for a heading using AI, with optional user_prompt
+    Generate content for a heading using Gemini AI, with optional user_prompt
     """
     try:
-        if not os.getenv('OPENAI_API_KEY'):
-            print("❌ Error: OPENAI_API_KEY not found. Cannot generate SRS content without AI.")
-            return f"Error: OpenAI API key not configured. Cannot generate content for '{heading}'. Please set OPENAI_API_KEY environment variable."
-        client = OpenAI()
+        print(f"📝 Generating content for heading: {heading}")
+
+        # Configure Gemini API with error handling
+        try:
+            genai.configure(api_key="AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ")
+            model = genai.GenerativeModel('gemini-2.0-flash')
+            print("✅ Gemini API configured for content generation")
+        except Exception as config_error:
+            print(f"❌ Failed to configure Gemini API: {config_error}")
+            return f"Error: Failed to configure Gemini API for '{heading}'. Please check API key and internet connection."
+
+        # Process user prompt to ensure professional SRS language
         if user_prompt and user_prompt.strip():
+            # Clean up user prompt to be professional
+            professional_prompt = user_prompt.replace("according to meeting summary", "based on system requirements")
+            professional_prompt = professional_prompt.replace("meeting transcript", "system specifications")
+            professional_prompt = professional_prompt.replace("meeting", "requirements analysis")
+            professional_prompt = professional_prompt.replace("according to", "based on")
+
             prompt = f"""
-            USER INSTRUCTIONS:
-            {user_prompt}
+            You are a professional SRS writer for MSBC Group company. Write professional SRS content that follows industry standards.
+
+            USER REQUIREMENTS:
+            {professional_prompt}
+
             SECTION HEADING: {heading}
-            MEETING TRANSCRIPT CONTEXT:
-            {uploaded_content if uploaded_content else "No meeting transcript available for context."}
+            SYSTEM CONTEXT: {uploaded_content if uploaded_content else "No additional context available."}
+
+            PROFESSIONAL SRS WRITING REQUIREMENTS:
+            1. Write in formal, professional SRS language
+            2. Do NOT use phrases like "according to meeting transcript" or "based on meeting summary"
+            3. Present information as established system requirements and specifications
+            4. Use industry-standard SRS terminology and structure
+            5. Use bullet points for explanations instead of long paragraphs
+            6. Generate 4-6 concise bullet points for this section
+            7. Each bullet point should be 1-2 sentences maximum
+            8. Focus on key requirements and specifications only
+            9. Avoid repetition of content from other sections
+            10. Maintain clear document hierarchy with unique section names
             """
         else:
             prompt = f"""
-            You are professional SRS writer of MSBC Group company and writing SRS for that company, Don't write any content as 'according to meeting transcript', Generate only content which is relevant to the SRS.
-            Generate detailed professional content for an SRS (Software Requirements Specification) section based on the meeting transcript provided.
+            You are a professional SRS writer for MSBC Group company. Write professional SRS content that follows industry standards.
+
             SECTION HEADING: {heading}
-            MEETING TRANSCRIPT CONTEXT:
-            {uploaded_content if uploaded_content else "No meeting transcript available for context."}
-            CRITICAL REQUIREMENTS:
-            1. Generate MINIMUM 5-7 paragraphs for this section
-            2. Each paragraph must be substantial (at least 2-3 sentences)
-            3. Total content should be 300-500 words minimum
-            4. Use clear, professional language suitable for SRS documentation
-            CRITICAL INSTRUCTIONS:
-            1. ONLY use information from the meeting transcript above - do not make up generic content
-            2. Reference specific discussions, decisions, and requirements mentioned in the meeting
-            3. Use exact project names, technologies, and requirements mentioned in the transcript
-            4. If the meeting discusses specific features, systems, or requirements related to this heading, include those details
-            5. Base your content on actual meeting discussions, not generic SRS templates
-            CONTENT STRUCTURE:
-            - Start with a brief overview of what this section covers based on meeting discussions
-            - Include specific requirements mentioned in the meeting
-            - Reference any decisions made during the meeting
-            - Include any technical specifications discussed
-            - Mention any constraints or considerations raised in the meeting
-            EXAMPLES:
-            - If the meeting discussed \"user authentication\", write about the specific authentication requirements mentioned
-            - If the meeting mentioned \"database design\", include the specific database requirements discussed
-            - If the meeting talked about \"API endpoints\", include the specific API requirements mentioned
-            Write in a clear, professional format suitable for SRS documentation. Each paragraph should be substantial and informative, drawing directly from the meeting transcript above.
+            SYSTEM CONTEXT: {uploaded_content if uploaded_content else "No additional context available."}
+
+            PROFESSIONAL SRS WRITING REQUIREMENTS:
+            1. Generate detailed professional content for this SRS section
+            2. Write in formal, professional SRS language
+            3. Do NOT use phrases like "according to meeting transcript" or "based on meeting summary"
+            4. Present information as established system requirements and specifications
+            5. Use industry-standard SRS terminology and structure
+            6. Use bullet points for explanations instead of long paragraphs
+            7. Generate 4-6 concise bullet points for this section
+            8. Each bullet point should be 1-2 sentences maximum
+            9. Focus on key requirements and specifications only
+            10. Avoid repetition of content from other sections
+            11. Maintain clear document hierarchy with unique section names
+            12. Use clear, professional language suitable for SRS documentation
+
+            CONTENT STRUCTURE (USE BULLET POINTS):
+            - Start with a brief overview bullet point of what this section covers
+            - Use bullet points for explanations instead of long paragraphs
+            - Include specific system requirements as concise bullet points
+            - Reference technical specifications in bullet format
+            - Include functional and non-functional requirements as bullet points
+            - Mention constraints or considerations as bullet points
+            - Avoid repetition of content from other sections
+            - Maintain clear document hierarchy with unique section names
+
+            BULLET POINT FORMAT EXAMPLES:
+            • Authentication: System implements multi-factor authentication with OAuth 2.0 integration
+            • Database: PostgreSQL database with encrypted data storage and automated backups
+            • API: RESTful API endpoints with rate limiting and comprehensive error handling
+
+            Write in bullet point format suitable for SRS documentation. Each bullet should be concise and informative, drawing from the system context provided above.
             """
-        response = client.chat.completions.create(
-            model="gpt-4.1-nano",
-            messages=[
-                {"role": "system", "content": "You are an expert software requirements analyst and technical writer. Generate detailed, professional content for SRS documents based on uploaded meeting summaries and requirements."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=2048,
-            temperature=0.7,
-        )
-        content = response.choices[0].message.content.strip()
-        return content
+
+        print(f"📤 Sending prompt to Gemini for '{heading}'...")
+        response = model.generate_content(prompt)
+
+        if response and response.text:
+            content = response.text.strip()
+            print(f"Generated {len(content)} characters for '{heading}'")
+            return content
+        else:
+            print(f"⚠️ Empty response from Gemini for '{heading}'")
+            return f"No content generated for '{heading}'. Please try again."
+
     except Exception as e:
         print(f"❌ Error generating content for heading '{heading}': {e}")
-        return f"Error generating content for '{heading}': {str(e)}"
+        print(f"🔍 Error type: {type(e).__name__}")
+
+        # Provide more specific error messages
+        if "API_KEY_INVALID" in str(e):
+            return f"Error: Invalid Gemini API key for '{heading}'. Please check your API key."
+        elif "PERMISSION_DENIED" in str(e):
+            return f"Error: Permission denied for Gemini API for '{heading}'. Check API key permissions."
+        elif "QUOTA_EXCEEDED" in str(e):
+            return f"Error: Gemini API quota exceeded for '{heading}'. Please try again later."
+        else:
+            return f"Error generating content for '{heading}': {str(e)}"
 
 
 
@@ -305,16 +2476,402 @@ def add_page_number(paragraph):
     run = paragraph.add_run()
     fldChar1 = OxmlElement('w:fldChar')
     fldChar1.set(qn('w:fldCharType'), 'begin')
-    
+
     instrText = OxmlElement('w:instrText')
     instrText.text = "PAGE"
-    
+
     fldChar2 = OxmlElement('w:fldChar')
     fldChar2.set(qn('w:fldCharType'), 'end')
-    
+
     run._r.append(fldChar1)
     run._r.append(instrText)
     run._r.append(fldChar2)
+
+def generate_diagram_signature(mermaid_code: str, heading: str) -> str:
+    """
+    Generate a unique signature for a diagram to prevent duplicates
+    Returns a signature string that represents the diagram's content and structure
+    """
+    import re
+    import hashlib
+
+    if not mermaid_code:
+        return ""
+
+    # Extract key structural elements
+    code_lower = mermaid_code.lower()
+
+    # Get diagram type
+    diagram_type = "unknown"
+    if 'flowchart' in code_lower or 'graph' in code_lower:
+        diagram_type = "flowchart"
+    elif 'sequencediagram' in code_lower:
+        diagram_type = "sequence"
+    elif 'erdiagram' in code_lower:
+        diagram_type = "er"
+    elif 'classdiagram' in code_lower:
+        diagram_type = "class"
+
+    # Extract node labels (normalized)
+    node_labels = re.findall(r'\[([^\]]+)\]', mermaid_code)
+    normalized_labels = [re.sub(r'[^a-zA-Z0-9\s]', '', label.lower().strip()) for label in node_labels]
+    normalized_labels.sort()
+
+    # Extract connection patterns
+    connections = re.findall(r'([A-Za-z0-9_]+)\s*-+>+\s*([A-Za-z0-9_]+)', mermaid_code)
+    connection_patterns = [f"{a.lower()}-{b.lower()}" for a, b in connections]
+    connection_patterns.sort()
+
+    # Create signature components
+    signature_parts = [
+        f"type:{diagram_type}",
+        f"heading:{heading.lower().replace(' ', '_')}",
+        f"nodes:{len(normalized_labels)}",
+        f"connections:{len(connection_patterns)}"
+    ]
+
+    # Add normalized node labels (limited to prevent signature explosion)
+    if normalized_labels:
+        node_signature = "_".join(normalized_labels[:5])  # Limit to first 5 nodes
+        signature_parts.append(f"labels:{node_signature}")
+
+    # Add connection patterns (limited)
+    if connection_patterns:
+        conn_signature = "_".join(connection_patterns[:5])  # Limit to first 5 connections
+        signature_parts.append(f"flows:{conn_signature}")
+
+    # Create final signature
+    signature = "|".join(signature_parts)
+
+    # Hash the signature for consistent length
+    signature_hash = hashlib.md5(signature.encode()).hexdigest()[:16]
+
+    return f"{diagram_type}_{signature_hash}"
+
+def is_diagram_duplicate(mermaid_code: str, heading: str) -> bool:
+    """
+    Check if a diagram is a duplicate of an already generated one
+    Returns True if duplicate, False if unique
+    """
+    global generated_diagram_signatures
+
+    signature = generate_diagram_signature(mermaid_code, heading)
+    print(f"🔍 Checking duplicate for '{heading}' - signature: {signature}")
+    print(f"🔍 Current signatures: {list(generated_diagram_signatures)}")
+
+    if signature in generated_diagram_signatures:
+        print(f"⚠️ Duplicate diagram detected for '{heading}' (signature: {signature})")
+        return True
+
+    # Check for semantic similarity with existing diagrams
+    for existing_sig in generated_diagram_signatures:
+        if existing_sig.startswith(signature.split('_')[0]):  # Same diagram type
+            # Check if nodes are too similar
+            existing_nodes = set(existing_sig.split('|'))
+            new_nodes = set(signature.split('|'))
+
+            # Calculate similarity
+            if existing_nodes and new_nodes:
+                intersection = existing_nodes.intersection(new_nodes)
+                union = existing_nodes.union(new_nodes)
+                similarity = len(intersection) / len(union) if union else 0
+
+                print(f"🔍 Similarity with {existing_sig}: {similarity:.1%}")
+
+                if similarity > 0.8:  # Increased threshold to 80% to allow more variation
+                    print(f"⚠️ Highly similar diagram detected for '{heading}' (similarity: {similarity:.1%})")
+                    return True
+
+    print(f"✅ No duplicate detected for '{heading}'")
+    return False
+
+def validate_diagram_for_a4(mermaid_code: str, heading: str) -> tuple[bool, str, dict]:
+    """
+    Validate that a diagram meets A4 compatibility requirements
+    Returns: (is_valid: bool, error_message: str, complexity_analysis: dict)
+    """
+    if not mermaid_code or not mermaid_code.strip():
+        return False, "Empty diagram code", {}
+
+    # Analyze complexity
+    complexity = analyze_diagram_complexity(mermaid_code)
+
+    # Check A4 compatibility
+    if complexity['is_too_complex']:
+        error_msg = f"Diagram too complex for A4: {', '.join(complexity['suggestions'])}"
+        return False, error_msg, complexity
+
+    # Check for duplicate diagrams
+    if is_diagram_duplicate(mermaid_code, heading):
+        return False, "Duplicate diagram detected", complexity
+
+    # Additional validation checks
+    import re
+
+    # Check for excessive text in nodes
+    node_labels = re.findall(r'\[([^\]]+)\]', mermaid_code)
+    long_labels = [label for label in node_labels if len(label) > 25]
+    if long_labels:
+        return False, f"Node labels too long for A4: {', '.join(long_labels[:3])}", complexity
+
+    # Check for excessive connections
+    connections = re.findall(r'-->|->>', mermaid_code)
+    if len(connections) > 10:
+        return False, f"Too many connections ({len(connections)}) for A4 page", complexity
+
+    # Check for excessive subgraphs
+    subgraphs = re.findall(r'subgraph\s+', mermaid_code)
+    if len(subgraphs) > 3:
+        return False, f"Too many subgraphs ({len(subgraphs)}) for A4 page", complexity
+
+    return True, "Diagram is A4 compatible", complexity
+
+def cleanup_diagram_for_a4(mermaid_code: str) -> str:
+    """
+    Clean up diagram code to ensure A4 compatibility
+    """
+    if not mermaid_code:
+        return mermaid_code
+
+    import re
+
+    print(f"🔧 Cleaning diagram for A4 compatibility...")
+
+    # Remove excessive whitespace and normalize
+    lines = [line.strip() for line in mermaid_code.split('\n') if line.strip()]
+
+    # Limit the number of nodes if too many
+    node_pattern = r'([A-Za-z0-9_]+)\[([^\]]+)\]'
+    nodes = re.findall(node_pattern, mermaid_code)
+
+    if len(nodes) > 6:
+        print(f"⚠️ Too many nodes ({len(nodes)}), limiting to 6 for A4 compatibility")
+        # Keep only the first 6 nodes and their connections
+        kept_nodes = set(node[0] for node in nodes[:6])
+
+        # Filter lines to keep only those with kept nodes
+        filtered_lines = []
+        for line in lines:
+            if any(node in line for node in kept_nodes):
+                filtered_lines.append(line)
+            elif line.startswith(('flowchart', 'graph', 'sequencediagram', 'erdiagram', 'classdiagram')):
+                filtered_lines.append(line)
+            elif line.startswith('subgraph') or line == 'end':
+                filtered_lines.append(line)
+
+        lines = filtered_lines
+
+    # AGGRESSIVE CONNECTION LIMITING for A4 compatibility
+    connection_pattern = r'([A-Za-z0-9_]+)\s*-+>+\s*([A-Za-z0-9_]+)'
+    connections = re.findall(connection_pattern, mermaid_code)
+
+    if len(connections) > 6:  # Limit to 6 connections maximum
+        print(f"⚠️ Too many connections ({len(connections)}), limiting to 6 for A4 compatibility")
+        # Keep only the first 6 connections
+        kept_connections = connections[:6]
+
+        # Filter lines to keep only those with kept connections
+        filtered_lines = []
+        for line in lines:
+            # Keep diagram type and structural lines
+            if line.startswith(('flowchart', 'graph', 'sequencediagram', 'erdiagram', 'classdiagram')):
+                filtered_lines.append(line)
+                continue
+            elif line.startswith('subgraph') or line == 'end':
+                filtered_lines.append(line)
+                continue
+
+            # Check if line contains a kept connection
+            line_has_kept_connection = False
+            for from_node, to_node in kept_connections:
+                if from_node in line and to_node in line:
+                    line_has_kept_connection = True
+                    break
+
+            if line_has_kept_connection:
+                filtered_lines.append(line)
+            elif '[' in line and ']' in line:  # Keep node definitions
+                filtered_lines.append(line)
+
+        lines = filtered_lines
+
+    # Limit subgraphs if too many
+    subgraph_count = sum(1 for line in lines if line.startswith('subgraph'))
+    if subgraph_count > 2:
+        print(f"⚠️ Too many subgraphs ({subgraph_count}), limiting to 2 for A4 compatibility")
+        # Keep only the first 2 subgraphs
+        subgraph_lines = []
+        subgraph_count = 0
+        in_subgraph = False
+
+        for line in lines:
+            if line.startswith('subgraph'):
+                if subgraph_count < 2:
+                    subgraph_lines.append(line)
+                    subgraph_count += 1
+                    in_subgraph = True
+                else:
+                    in_subgraph = False
+            elif line == 'end' and in_subgraph:
+                subgraph_lines.append(line)
+                in_subgraph = False
+            elif in_subgraph and subgraph_count <= 2:
+                subgraph_lines.append(line)
+            elif not in_subgraph:
+                subgraph_lines.append(line)
+
+        lines = subgraph_lines
+
+    # Clean up node labels to be shorter
+    cleaned_lines = []
+    for line in lines:
+        # Shorten node labels if they're too long
+        if '[' in line and ']' in line:
+            # Find and shorten node labels
+            def shorten_label(match):
+                label = match.group(1)
+                if len(label) > 15:
+                    # Keep first and last few characters, add ellipsis
+                    return f'[{label[:8]}...{label[-4:]}]'
+                return match.group(0)
+
+            line = re.sub(r'\[([^\]]+)\]', shorten_label, line)
+
+        cleaned_lines.append(line)
+
+    result = '\n'.join(cleaned_lines)
+    print(f"✅ Diagram cleaned for A4 compatibility")
+
+    return result
+
+def get_diagram_generation_summary() -> dict:
+    """
+    Get a summary of the current diagram generation status
+    """
+    global total_diagrams_generated, generated_diagram_signatures, current_document_diagrams
+
+    summary = {
+        'total_diagrams_generated': total_diagrams_generated,
+        'max_diagrams_allowed': 3,
+        'unique_signatures': len(generated_diagram_signatures),
+        'current_diagrams': len(current_document_diagrams),
+        'diagram_types': {},
+        'a4_compatibility_status': 'Unknown'
+    }
+
+    # Analyze diagram types
+    for diagram in current_document_diagrams:
+        diagram_type = diagram.get('diagramType', 'unknown')
+        if diagram_type not in summary['diagram_types']:
+            summary['diagram_types'][diagram_type] = 0
+        summary['diagram_types'][diagram_type] += 1
+
+    # Check A4 compatibility
+    if total_diagrams_generated == 0:
+        summary['a4_compatibility_status'] = 'No diagrams generated'
+    elif total_diagrams_generated >= 3:
+        summary['a4_compatibility_status'] = 'Maximum diagrams reached'
+    else:
+        summary['a4_compatibility_status'] = 'Ready for more diagrams'
+
+    return summary
+
+def print_diagram_generation_summary():
+    """
+    Print a formatted summary of diagram generation status
+    """
+    summary = get_diagram_generation_summary()
+
+    print("\n" + "="*60)
+    print("📊 DIAGRAM GENERATION SUMMARY")
+    print("="*60)
+    print(f"📈 Total diagrams generated: {summary['total_diagrams_generated']}/{summary['max_diagrams_allowed']}")
+    print(f"🔑 Unique diagram signatures: {summary['unique_signatures']}")
+    print(f"📄 Current diagrams in memory: {summary['current_diagrams']}")
+    print(f"✅ A4 compatibility status: {summary['a4_compatibility_status']}")
+
+    if summary['diagram_types']:
+        print(f"\n🎨 Diagram types generated:")
+        for diagram_type, count in summary['diagram_types'].items():
+            print(f"   • {diagram_type}: {count}")
+
+    print("="*60 + "\n")
+
+def generate_sequence_diagram_specialized(heading: str, content: str, uploaded_content: str = "", user_prompt: str = "", full_srs_content: str = "") -> str:
+    """
+    Specialized function to generate sequence diagrams when main generation fails
+    Uses a more focused approach for sequence diagrams
+    """
+    try:
+        print(f"🎯 Using specialized sequence diagram generation for: {heading}")
+
+        # Configure Gemini API
+        genai.configure(api_key="AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ")
+        model = genai.GenerativeModel('gemini-2.0-flash')
+
+        # Specialized prompt for sequence diagrams
+        prompt = f"""
+        Generate a SIMPLE sequence diagram for this system section.
+
+        SECTION: {heading}
+        CONTENT: {content[:600]}
+        CONTEXT: {uploaded_content[:400] if uploaded_content else "No additional context"}
+
+        REQUIREMENTS:
+        1. Create a sequence diagram with MAXIMUM 3-4 participants
+        2. Show only the MOST IMPORTANT interactions (4-6 messages maximum)
+        3. Use simple participant names like "User", "System", "Database"
+        4. Keep messages short and clear
+        5. Focus on the core workflow only
+        6. MUST fit on A4 page
+
+        SEQUENCE DIAGRAM RULES:
+        1. Start with: sequenceDiagram
+        2. Declare participants: participant User, participant System, participant Database
+        3. Use simple messages: User->>System: Request, System-->>User: Response
+        4. Maximum 4-6 message exchanges
+        5. No complex logic or loops
+
+        EXAMPLE FORMAT:
+        sequenceDiagram
+            participant User
+            participant System
+            participant Database
+            User->>System: Login Request
+            System->>Database: Validate User
+            Database-->>System: User Data
+            System-->>User: Login Success
+
+        Generate ONLY the sequence diagram code:
+        """
+
+        response = model.generate_content(prompt)
+        if response and response.text:
+            mermaid_code = response.text.strip()
+
+            # Clean up the response
+            if mermaid_code.startswith('```'):
+                lines = mermaid_code.split('\n')
+                mermaid_code = '\n'.join(lines[1:-1]) if len(lines) > 2 else mermaid_code
+
+            # Apply syntax fixes
+            fixed_code = fix_mermaid_syntax(mermaid_code)
+
+            # Validate for A4 compatibility
+            is_valid, error_msg, complexity = validate_diagram_for_a4(fixed_code, heading)
+            if is_valid:
+                print(f"✅ Specialized sequence diagram generated successfully")
+                return fixed_code
+            else:
+                print(f"⚠️ Specialized sequence diagram still not A4 compatible: {error_msg}")
+                return None
+        else:
+            print(f"⚠️ No response from specialized sequence diagram generation")
+            return None
+
+    except Exception as e:
+        print(f"❌ Error in specialized sequence diagram generation: {e}")
+        return None
 
 if __name__ == "__main__":
     # Test the generator
@@ -338,5 +2895,5 @@ if __name__ == "__main__":
             'source': 'Custom Section'
         }
     ]
-    
-    generate_srs_docx(test_headings, 'test_srs.docx') 
+
+    generate_srs_docx(test_headings, 'test_srs.docx')

@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { toast } from 'react-hot-toast';
-import { CheckCircleIcon, PlusIcon, DocumentTextIcon, SparklesIcon, ArrowRightIcon } from '@heroicons/react/24/outline';
+import { CheckCircleIcon, PlusIcon, DocumentTextIcon, SparklesIcon, ArrowRightIcon, PencilIcon } from '@heroicons/react/24/outline';
 import UploadArea from '../components/UploadArea';
+import DiagramEditor from '../components/DiagramEditor';
 import { useDocumentData } from '../DocumentDataContext';
 import { srsApi, errorHandler } from '../api/srsApi';
 import { useNavigate } from 'react-router-dom';
@@ -20,6 +21,11 @@ const SRSGenerator = () => {
   const [filesProcessed, setFilesProcessed] = useState(false);
   const [aiGeneratedHeadings, setAiGeneratedHeadings] = useState({});
   const [selectedAiHeadings, setSelectedAiHeadings] = useState({});
+
+  // Diagram Editor State
+  const [showDiagramEditor, setShowDiagramEditor] = useState(false);
+  const [currentDiagramData, setCurrentDiagramData] = useState(null);
+  const [customSectionDiagrams, setCustomSectionDiagrams] = useState({});
 
   useEffect(() => {
     loadHeadings();
@@ -181,6 +187,120 @@ const SRSGenerator = () => {
     toast.success('Custom section removed');
   };
 
+  // Diagram Editor Functions
+  const openDiagramEditor = (sectionId, sectionTitle, existingDiagram = null) => {
+    const diagramType = detectDiagramType(sectionTitle);
+    const initialCode = existingDiagram?.mermaidCode || generateInitialDiagramCode(diagramType, sectionTitle);
+
+    setCurrentDiagramData({
+      sectionId,
+      sectionTitle,
+      diagramType,
+      initialCode,
+      existingDiagram
+    });
+    setShowDiagramEditor(true);
+  };
+
+  const detectDiagramType = (title) => {
+    const titleLower = title.toLowerCase();
+    if (titleLower.includes('sequence') || titleLower.includes('flow') || titleLower.includes('workflow')) {
+      return 'sequence';
+    } else if (titleLower.includes('er') || titleLower.includes('database') || titleLower.includes('schema')) {
+      return 'er';
+    } else if (titleLower.includes('class') || titleLower.includes('object')) {
+      return 'class';
+    } else {
+      return 'flowchart';
+    }
+  };
+
+  const generateInitialDiagramCode = (type, title) => {
+    const templates = {
+      flowchart: `flowchart TD
+    A[Start] --> B{Process}
+    B -->|Success| C[Complete]
+    B -->|Error| D[Handle Error]
+    C --> E[End]
+    D --> E`,
+      sequence: `sequenceDiagram
+    participant User
+    participant System
+    participant Database
+
+    User->>System: Request
+    System->>Database: Query
+    Database-->>System: Data
+    System-->>User: Response`,
+      er: `erDiagram
+    USER {
+        int id PK
+        string name
+        string email
+    }
+    ORDER {
+        int id PK
+        int user_id FK
+        date created_at
+    }
+    USER ||--o{ ORDER : places`,
+      class: `classDiagram
+    class User {
+        +String name
+        +String email
+        +login()
+        +logout()
+    }
+    class System {
+        +processRequest()
+        +sendResponse()
+    }`
+    };
+
+    return templates[type] || templates.flowchart;
+  };
+
+  const saveDiagram = (diagramData) => {
+    const { sectionId, sectionTitle } = currentDiagramData;
+
+    // Save diagram to custom section diagrams
+    setCustomSectionDiagrams(prev => ({
+      ...prev,
+      [sectionId]: {
+        ...diagramData,
+        sectionTitle,
+        lastModified: new Date().toISOString()
+      }
+    }));
+
+    // Update the custom section to indicate it has a diagram
+    setCustomSections(prev => prev.map(section =>
+      section.id === sectionId
+        ? { ...section, hasDiagram: true, diagramType: diagramData.diagramType }
+        : section
+    ));
+
+    setShowDiagramEditor(false);
+    setCurrentDiagramData(null);
+    toast.success('Diagram saved successfully!');
+  };
+
+  const removeDiagram = (sectionId) => {
+    setCustomSectionDiagrams(prev => {
+      const newDiagrams = { ...prev };
+      delete newDiagrams[sectionId];
+      return newDiagrams;
+    });
+
+    setCustomSections(prev => prev.map(section =>
+      section.id === sectionId
+        ? { ...section, hasDiagram: false, diagramType: null }
+        : section
+    ));
+
+    toast.success('Diagram removed');
+  };
+
   const handleAiHeadingToggle = (path) => {
     setSelectedAiHeadings(prev => {
       const newState = { ...prev, [path]: !prev[path] };
@@ -309,6 +429,7 @@ const SRSGenerator = () => {
         standardHeadings: selectedStandardHeadings,
         customSections: customSections,
         aiHeadings: selectedAiHeadingsArray,
+        customSectionDiagrams: customSectionDiagrams,
         projectTitle: documentData.projectTitle,
         projectDescription: documentData.projectDescription
       }
@@ -551,32 +672,70 @@ const SRSGenerator = () => {
                     <input
                       type="checkbox"
                       checked={section.selected !== false}
-                                             onChange={() => {
-                         setCustomSections(prev => {
-                           const newSections = prev.map((s, i) => i === idx ? { ...s, selected: !s.selected } : s);
-                           
-                           // Save to documentData
-                           setDocumentData(prevData => ({
-                             ...prevData,
-                             customSections: newSections
-                           }));
-                           
-                           return newSections;
-                         });
-                       }}
+                      onChange={() => {
+                        setCustomSections(prev => {
+                          const newSections = prev.map((s, i) => i === idx ? { ...s, selected: !s.selected } : s);
+
+                          // Save to documentData
+                          setDocumentData(prevData => ({
+                            ...prevData,
+                            customSections: newSections
+                          }));
+
+                          return newSections;
+                        });
+                      }}
                       className="mr-3 h-4 w-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
                     />
-                    <div>
+                    <div className="flex-1">
                       <div className="font-medium text-gray-900">{section.title}</div>
                       <div className="text-sm text-gray-500">{section.purpose}</div>
+                      {section.hasDiagram && (
+                        <div className="text-xs text-green-600 mt-1 flex items-center">
+                          <CheckCircleIcon className="w-3 h-3 mr-1" />
+                          {section.diagramType} diagram attached
+                        </div>
+                      )}
                     </div>
                   </div>
-                  <button
-                    onClick={() => removeCustomSection(section.id)}
-                    className="text-red-600 hover:text-red-800"
-                  >
-                    Remove
-                  </button>
+                  <div className="flex items-center gap-2">
+                    {/* Diagram Editor Button */}
+                    <button
+                      onClick={() => openDiagramEditor(
+                        section.id,
+                        section.title,
+                        customSectionDiagrams[section.id]
+                      )}
+                      className="p-2 text-blue-600 hover:text-blue-800 hover:bg-blue-50 rounded-full transition-colors"
+                      title={section.hasDiagram ? "Edit diagram" : "Add diagram"}
+                    >
+                      <PencilIcon className="w-4 h-4" />
+                    </button>
+
+                    {/* Remove Diagram Button */}
+                    {section.hasDiagram && (
+                      <button
+                        onClick={() => removeDiagram(section.id)}
+                        className="p-2 text-orange-600 hover:text-orange-800 hover:bg-orange-50 rounded-full transition-colors"
+                        title="Remove diagram"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    )}
+
+                    {/* Remove Section Button */}
+                    <button
+                      onClick={() => removeCustomSection(section.id)}
+                      className="p-2 text-red-600 hover:text-red-800 hover:bg-red-50 rounded-full transition-colors"
+                      title="Remove section"
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
@@ -728,6 +887,19 @@ const SRSGenerator = () => {
               </div>
           </div>
       </div>
+
+      {/* Diagram Editor Modal */}
+      {showDiagramEditor && currentDiagramData && (
+        <DiagramEditor
+          initialMermaidCode={currentDiagramData.initialCode}
+          diagramType={currentDiagramData.diagramType}
+          onSave={saveDiagram}
+          onClose={() => {
+            setShowDiagramEditor(false);
+            setCurrentDiagramData(null);
+          }}
+        />
+      )}
     </div>
   );
 };

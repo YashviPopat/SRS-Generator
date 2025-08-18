@@ -14,7 +14,7 @@
       "Scope": "Defines boundaries, limits, and coverage of the system."
     },
     "Sequence Diagram": {
-      "Sequence Diagram": "Illustration of interaction flow among system components."
+      "Sequence Diagram": "Visual representation of how system components interact over time to accomplish specific tasks."
     },
     "Functional Requirements": {
       "Use Case 1": "If applicable regarding to topic: It gives the details of the use case."

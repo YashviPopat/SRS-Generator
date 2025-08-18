@@ -6,7 +6,10 @@ import io
 import google.generativeai as genai
 import os
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyAv7B9Y6kivXsOkKUgcrJF0Z3Z3wVkcuFA")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("⚠️ Warning: GEMINI_API_KEY not found in environment variables")
+    print("💡 Please set GEMINI_API_KEY in your .env file or system environment")
 
 class DocumentExtractor:
     """Extract headings and content from various document types"""
@@ -333,11 +336,11 @@ class DocumentExtractor:
 
 def get_gemini_srs_headings_from_transcript(transcript_text: str) -> dict:
     """
-    Call Gemini 2.5 Flash model to generate SRS headings and subheadings (nested, with purposes) from a meeting transcript.
+    Call Gemini 1.5 Flash model to generate SRS headings and subheadings (nested, with purposes) from a meeting transcript.
     Returns a nested dict: {heading: {subheading: purpose, ...}, ...}
     """
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     
     prompt = f"""
     You are an expert software requirements analyst. Analyze the following meeting transcript and generate SRS headings that are SPECIFICALLY relevant to the content discussed in the meeting, Only include which are actually written in SRS document, not include like in meeting discussion or as meeting transcript because that type of sentences are not mentioned in SRS document.

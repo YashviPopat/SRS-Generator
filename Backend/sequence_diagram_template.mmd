@@ -1,0 +1,34 @@
+sequenceDiagram
+    participant User
+    participant Frontend
+    participant Backend
+    participant Database
+    participant LearningSystem
+
+    User->>Frontend: Request learning materials
+    Frontend->>Backend: Get materials request
+    Backend->>Database: Query learning content
+    Database-->>Backend: Return content data
+    Backend->>LearningSystem: Process materials
+    LearningSystem-->>Backend: Processed materials
+    Backend-->>Frontend: Learning materials response
+    Frontend-->>User: Display materials
+
+    Note over User,Frontend: User interaction phase
+    Note over Backend,Database: Data retrieval phase
+    Note over LearningSystem: Content processing
+
+    alt Materials available
+        Backend->>Frontend: Send materials
+        Frontend->>User: Display content
+    else No materials found
+        Backend->>Frontend: Send error message
+        Frontend->>User: Show "No materials available"
+    end
+
+    loop For each material
+        User->>Frontend: Select material
+        Frontend->>Backend: Load material details
+        Backend-->>Frontend: Material content
+        Frontend-->>User: Show material
+    end

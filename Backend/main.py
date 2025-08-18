@@ -1,32 +1,41 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 import uvicorn
 import uuid
 import os
 import json
 import re
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
 
 # Load environment variables
 from dotenv import load_dotenv
-google_api_key = os.getenv("GOOGLE_API_KEY")
-import os
 
 # Try to load .env file, but don't fail if it doesn't exist
 try:
     load_dotenv()
+    print("✅ .env file loaded successfully")
 except Exception as e:
     print(f"Warning: Could not load .env file: {e}")
     print("Continuing without .env file - using system environment variables")
+
+# Get API keys from environment variables
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+# Validate API keys
+if not gemini_api_key:
+    print("⚠️ Warning: GEMINI_API_KEY not found in environment variables")
+    print("💡 Please set GEMINI_API_KEY in your .env file or system environment")
+    gemini_api_key = "AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ"  # Fallback for development
 
 # Import our models and utilities
 from models.srs_model import *
 from logic.heading_utils import load_standard_headings, get_all_headings, merge_headings
 from logic.extractor import DocumentExtractor
 from logic.extractor import get_gemini_srs_headings_from_transcript
-from logic.vector_store import VectorStoreManager
+
 from fastapi.middleware.cors import CORSMiddleware
 
 # Initialize FastAPI app
@@ -49,107 +58,68 @@ app.add_middleware(
 uploaded_documents = {}
 srs_structures = {}
 generated_files = {}
+document_diagrams = {}  # Store diagrams for each document
 extracted_text_content = {}  # Store extracted text content from PDFs
 processing_status = {}  # Track processing status
 
-# Initialize OpenAI client for vector store operations
-from openai import OpenAI
-import os
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Initialize Gemini client for AI operations
+import google.generativeai as genai
 
-# --- Step 1: Store PDFs in OpenAI Vector Store ---
-async def store_pdfs_in_vector_store(pdf_file_contents: dict):
-    """Store PDFs in OpenAI Vector Store using responses API"""
+# Configure Gemini with the API key from environment variables
+try:
+    genai.configure(api_key=gemini_api_key)
+    print(f"✅ Gemini API configured successfully with key: {gemini_api_key[:10]}...")
+except Exception as e:
+    print(f"❌ Failed to configure Gemini API: {e}")
+    print("⚠️ Gemini functionality may not work properly")
+
+# --- Step 1: Process PDFs with Gemini ---
+async def process_pdfs_with_gemini(pdf_file_contents: dict):
+    """Process PDFs using Gemini AI for content extraction"""
     try:
-        print("📤 Creating vector store...")
-        vector_store = openai_client.vector_stores.create(name="srs_documents")
-        
-        print("📤 Uploading PDF files...")
-        file_objects = []
-        temp_paths = []
-        
+        print("📤 Processing PDFs with Gemini...")
+
+        all_content = ""
+        processed_files = []
+
         for file_name, content in pdf_file_contents.items():
             try:
-                # Create temporary file
-                temp_path = f"temp_{file_name.replace(' ', '_').replace('/', '_')}"
-                with open(temp_path, "wb") as f:
-                    f.write(content)
-                temp_paths.append(temp_path)
-                
-                # Open file for upload
-                file_obj = open(temp_path, "rb")
-                file_objects.append(file_obj)
-                print(f"✅ Prepared {file_name} for upload")
-                
+                # Extract text from PDF using existing extractor
+                extractor = DocumentExtractor()
+                extracted_text = extractor.extract_text_from_pdf_bytes(content)
+
+                if extracted_text and not extracted_text.startswith("Error"):
+                    all_content += f"\n--- {file_name} ---\n"
+                    all_content += extracted_text
+                    processed_files.append(file_name)
+                    print(f"✅ Processed file: {file_name}")
+                else:
+                    print(f"⚠️ Failed to extract text from: {file_name}")
+
             except Exception as e:
-                print(f"❌ Failed to prepare {file_name}: {e}")
+                print(f"❌ Failed to process file {file_name}: {e}")
                 continue
-        
-        if file_objects:
-            print("📤 Uploading files to vector store...")
-            # First upload files to OpenAI
-            uploaded_file_ids = []
-            for file_obj in file_objects:
-                try:
-                    uploaded_file = openai_client.files.create(file=file_obj, purpose="assistants")
-                    uploaded_file_ids.append(uploaded_file.id)
-                    print(f"✅ Uploaded file: {uploaded_file.id}")
-                except Exception as e:
-                    print(f"❌ Failed to upload file: {e}")
-                    continue
-            
-            # Then add files to vector store using the correct API
-            if uploaded_file_ids:
-                for file_id in uploaded_file_ids:
-                    try:
-                        openai_client.vector_stores.files.create(
-                            vector_store_id=vector_store.id,
-                            file_id=file_id
-                        )
-                        print(f"✅ Added file {file_id} to vector store")
-                    except Exception as e:
-                        print(f"❌ Failed to add file {file_id} to vector store: {e}")
-                        continue
-                
-                print(f"✅ Added {len(uploaded_file_ids)} files to vector store")
-            else:
-                print("❌ No files were successfully uploaded")
-            
-            # Clean up temporary files
-            for temp_path in temp_paths:
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except:
-                    pass
-            
-            # Close file objects
-            for file_obj in file_objects:
-                try:
-                    file_obj.close()
-                except:
-                    pass
-            
-            print(f"✅ Vector store created: {vector_store.id}")
-            return vector_store.id
+
+        if processed_files:
+            print(f"✅ Successfully processed {len(processed_files)} files")
+            return all_content
         else:
-            print("❌ No files prepared for upload")
+            print("❌ No files were successfully processed")
             return None
-            
+
     except Exception as e:
-        print(f"❌ Failed to store PDFs in vector store: {e}")
+        print(f"❌ Failed to process PDFs: {e}")
         return None
 
-# --- Step 2: Extract TOC from stored content ---
-async def extract_toc_from_vector_store(vector_store_id: str):
-    """Extract TOC from stored content using OpenAI responses API"""
+# --- Step 2: Extract TOC using Gemini ---
+async def extract_toc_with_gemini(content: str):
+    """Extract TOC from content using Gemini AI"""
     try:
-        print("🔍 Extracting TOC from vector store...")
-        
-        # Use the correct API structure for responses with vector stores
-        response = openai_client.responses.create(
-            model="gpt-4.1-nano",
-            input="""Extract ALL headings and section titles from these documents. Look for:
+        print("🔍 Extracting TOC with Gemini...")
+
+        model = genai.GenerativeModel('gemini-2.0-flash')
+
+        prompt = f"""Extract ALL headings and section titles from the following document content. Look for:
 
 1. Table of Contents (TOC) sections
 2. Chapter headings and section headings
@@ -164,32 +134,31 @@ Return ALL headings found in a clean format, one per line, removing page numbers
 If you find multiple documents, extract headings from all of them and combine the results.
 If no clear headings are found, extract any text that appears to be a section title or heading.
 
-Be thorough and extract as many headings as possible from the document structure.""",
-            tools=[{
-                "type": "file_search",
-                "vector_store_ids": [vector_store_id]
-            }]
-        )
-        
-        toc_text = response.output_text
+Be thorough and extract as many headings as possible from the document structure.
+
+Document Content:
+{content[:8000]}"""  # Limit content to avoid token limits
+
+        response = model.generate_content(prompt)
+        toc_text = response.text
         print(f"✅ TOC extracted: {len(toc_text)} characters")
         print(f"📄 TOC preview: {toc_text[:500]}...")
-        
+
         if not toc_text or len(toc_text.strip()) < 10:
             print("⚠️ Warning: Very short or empty TOC extracted")
             return {"toc": "No headings found in documents"}
-        
+
         return {"toc": toc_text}
-        
+
     except Exception as e:
         print(f"❌ Failed to extract TOC: {e}")
         return {"toc": ""}
 
-# --- Step 3: Generate headings using OpenAI (replaces Gemini) ---
-async def generate_headings_with_openai(toc_result: dict):
-    """Generate headings using OpenAI based on TOC"""
+# --- Step 3: Generate headings using Gemini ---
+async def generate_headings_with_gemini(toc_result: dict):
+    """Generate headings using Gemini based on TOC"""
     try:
-        print("🤖 Generating headings with OpenAI...")
+        print("🤖 Generating headings...")
         toc_text = toc_result.get('toc', '')
         if not toc_text:
             print("⚠️ No TOC text available for OpenAI")
@@ -207,34 +176,27 @@ async def generate_headings_with_openai(toc_result: dict):
         Focus on creating headings that are relevant to the content and suitable for SRS documentation.
         Common SRS headings include: Introduction, Functional Requirements, Non-Functional Requirements, System Architecture, User Interface, Data Requirements, etc.
         """
-        if not os.getenv('OPENAI_API_KEY'):
-            print("❌ No OpenAI API key found. Please set OPENAI_API_KEY environment variable.")
-            print("🔧 Returning sample headings for testing...")
-            sample_headings = {
-                "Introduction": "Overview and purpose of the system",
-                "Functional Requirements": "Core system functions and features",
-                "Non-Functional Requirements": "Performance, security, and usability requirements",
-                "System Architecture": "Technical design and component structure",
-                "User Interface": "UI/UX specifications and wireframes"
-            }
-            print(f"🔧 Sample headings: {sample_headings}")
-            return {"openai_headings": sample_headings}
-        from openai import OpenAI
-        client = OpenAI()
-        response = client.chat.completions.create(
-            model="gpt-4.1-nano",
-            messages=[
-                {"role": "system", "content": "You are an expert software requirements analyst. Generate SRS headings in JSON format as described."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.5
-        )
-        openai_text = response.choices[0].message.content.strip()
-        print(f"✅ OpenAI headings extracted: {len(openai_text)} characters")
-        print(f"📄 OpenAI text preview: {openai_text[:500]}...")
-        return {"openai_headings": openai_text}
+        # Note: This fallback is kept for compatibility but shouldn't be needed with Gemini
+        # if not os.getenv('GEMINI_API_KEY'):
+        #     print("❌ No Gemini API key found. Please set GEMINI_API_KEY environment variable.")
+        #     print("🔧 Returning sample headings for testing...")
+        #     sample_headings = {
+        #         "Introduction": "Overview and purpose of the system",
+        #         "Functional Requirements": "Core system functions and features",
+        #         "Non-Functional Requirements": "Performance, security, and usability requirements",
+        #         "System Architecture": "Technical design and component structure",
+        #         "User Interface": "UI/UX specifications and wireframes"
+        #     }
+        #     print(f"🔧 Sample headings: {sample_headings}")
+        #     return {"openai_headings": sample_headings}
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        response = model.generate_content(prompt)
+        gemini_text = response.text.strip()
+        print(f"✅ Gemini headings extracted: {len(gemini_text)} characters")
+        print(f"📄 Gemini text preview: {gemini_text[:500]}...")
+        return {"openai_headings": gemini_text}  # Keep the key name for compatibility
     except Exception as e:
-        print(f"❌ Failed to generate OpenAI headings: {e}")
+        print(f"❌ Failed to generate Gemini headings: {e}")
         return {"openai_headings": ""}
 
 # --- Helper functions ---
@@ -1002,7 +964,7 @@ async def generate_srs_document(request: Dict[str, Any]):
         # Ensure generated_docs directory exists
         os.makedirs("generated_docs", exist_ok=True)
         
-        # Create SRS document using the existing generation logic
+        # Create SRS document using the main generation logic
         from logic.srs_generator import generate_srs_docx
         
         # Prepare headings data
@@ -1065,22 +1027,31 @@ async def generate_srs_document(request: Dict[str, Any]):
         if uploaded_content:
             print(f"📄 Content preview: {uploaded_content[:200]}...")
         
-        generate_srs_docx(all_headings, output_path, uploaded_content)
-        
+        # Generate SRS and get the actual generated diagrams
+        generated_diagrams = generate_srs_docx(all_headings, output_path, uploaded_content)
+
+        # Store diagrams for this document
+        if generated_diagrams:
+            document_diagrams[file_id] = generated_diagrams
+            print(f"📊 Stored {len(generated_diagrams)} diagrams for document {file_id}")
+
         # Store file reference
         generated_files[file_id] = {
             'filename': output_filename,
             'path': output_path,
             'created_at': datetime.now().isoformat(),
-            'headings_count': len(all_headings)
+            'headings_count': len(all_headings),
+            'diagrams_count': len(generated_diagrams) if generated_diagrams else 0
         }
         
-        # Return the file for download
-        return FileResponse(
+        # Return the file for download with document ID in headers
+        response = FileResponse(
             path=output_path,
             filename=output_filename,
             media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
+        response.headers["X-Document-ID"] = file_id
+        return response
         
     except Exception as e:
         raise HTTPException(
@@ -1088,112 +1059,7 @@ async def generate_srs_document(request: Dict[str, Any]):
             detail=f"Failed to generate SRS document: {str(e)}"
         )
 
-@app.post("/create-vector-store")
-async def create_vector_store():
-    """
-    Create vector store from uploaded documents and extract TOC
-    """
-    global vector_store_manager
-    
-    try:
-        # Get all uploaded documents
-        if not uploaded_documents:
-            raise HTTPException(
-                status_code=400,
-                detail="No documents uploaded. Please upload documents first."
-            )
-        
-        # Create vector store manager
-        vector_store_manager = VectorStoreManager()
-        
-        # Extract headings from all uploaded documents
-        all_extracted_headings = []
-        
-        for doc_id, doc_info in uploaded_documents.items():
-            if "binary_content" in doc_info and doc_info["binary_content"]:
-                try:
-                    # Determine file type
-                    file_extension = doc_info["file_name"].lower().split('.')[-1]
-                    if file_extension == 'pdf':
-                        file_type = 'pdf'
-                    elif file_extension in ['docx', 'doc']:
-                        file_type = 'docx'
-                    else:
-                        file_type = 'txt'
-                    
-                    # Extract headings using DocumentExtractor
-                    extracted_data = DocumentExtractor.extract_document_headings(
-                        doc_info["binary_content"], 
-                        file_type
-                    )
-                    
-                    # Format headings
-                    raw_headings = extracted_data.get('headings', [])
-                    formatted_headings = DocumentExtractor.format_headings_for_api(
-                        raw_headings, 
-                        doc_info["file_name"]
-                    )
-                    
-                    all_extracted_headings.extend(formatted_headings)
-                    
-                except Exception as e:
-                    print(f"⚠️ Failed to extract headings from {doc_info['file_name']}: {e}")
-        
-        # Save uploaded PDF files temporarily and create vector store
-        temp_pdf_paths = []
-        
-        for doc_id, doc_info in uploaded_documents.items():
-            if "binary_content" in doc_info and doc_info["binary_content"]:
-                # Save binary content to temporary file
-                temp_file_path = f"temp_{doc_info['file_name']}"
-                with open(temp_file_path, "wb") as f:
-                    f.write(doc_info["binary_content"])
-                temp_pdf_paths.append(temp_file_path)
-        
-        if temp_pdf_paths:
-            # Create vector store from PDF files
-            vector_store_manager = VectorStoreManager()
-            
-            # Upload PDF files to OpenAI
-            uploaded_file_ids = vector_store_manager.upload_pdf_files(temp_pdf_paths)
-            
-            # Create vector store
-            vector_store_id = vector_store_manager.create_vector_store(
-                uploaded_file_ids, 
-                "srs_documents_store"
-            )
-            
-            # Extract and clean headings
-            clean_headings = vector_store_manager.extract_and_clean_headings(
-                vector_store_id, 
-                "clean_extracted_headings.json"
-            )
-            
-            # Clean up temporary files
-            for temp_path in temp_pdf_paths:
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-            
-            return {
-                "success": True,
-                "message": f"Vector store created successfully with {len(clean_headings)} headings",
-                "extracted_headings": clean_headings,
-                "vector_store_id": vector_store_id
-            }
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="No valid PDF files found in uploaded documents."
-            )
-        
-    except Exception as e:
-        print(f"❌ Failed to create vector store: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to create vector store: {str(e)}"
-        )
+
 
 @app.post("/process-all-files")
 async def process_all_files(files: List[UploadFile] = File(...)):
@@ -1370,18 +1236,18 @@ async def process_all_files(files: List[UploadFile] = File(...)):
         if pdf_file_contents:
             print(f"🔍 Processing {len(pdf_file_contents)} PDF files through synchronous pipeline...")
             try:
-                # Step 1: Store PDFs in OpenAI Vector Store
-                print("📤 Step 1: Storing PDFs in OpenAI Vector Store...")
-                vector_store_id = await store_pdfs_in_vector_store(pdf_file_contents)
-                
-                if vector_store_id:
-                    # Step 2: Extract TOC from stored content
-                    print("🔍 Step 2: Extracting TOC from stored content...")
-                    toc_result = await extract_toc_from_vector_store(vector_store_id)
-                    
+                # Step 1: Process PDFs with Gemini
+                print("📤 Step 1: Processing PDFs with Gemini...")
+                all_content = await process_pdfs_with_gemini(pdf_file_contents)
+
+                if all_content:
+                    # Step 2: Extract TOC from content
+                    print("🔍 Step 2: Extracting TOC from content...")
+                    toc_result = await extract_toc_with_gemini(all_content)
+
                     # Step 3: Generate headings using Gemini based on TOC
                     print("🤖 Step 3: Generating headings using Gemini...")
-                    gemini_headings = await generate_headings_with_openai(toc_result)
+                    gemini_headings = await generate_headings_with_gemini(toc_result)
                     
                     # Update extracted headings with TOC results
                     for file_name in pdf_file_contents.keys():
@@ -1499,19 +1365,19 @@ async def process_docs_folder():
                 detail="Failed to load any PDF files"
             )
         
-        # Step 1: Store PDFs in OpenAI Vector Store
-        print("📤 Step 1: Storing PDFs in OpenAI Vector Store...")
-        vector_store_id = await store_pdfs_in_vector_store(pdf_file_contents)
-        
-        if not vector_store_id:
+        # Step 1: Process PDFs with Gemini
+        print("📤 Step 1: Processing PDFs with Gemini...")
+        all_content = await process_pdfs_with_gemini(pdf_file_contents)
+
+        if not all_content:
             raise HTTPException(
                 status_code=500,
-                detail="Failed to create vector store"
+                detail="Failed to process PDFs"
             )
-        
-        # Step 2: Extract TOC from stored content
-        print("🔍 Step 2: Extracting TOC from stored content...")
-        toc_result = await extract_toc_from_vector_store(vector_store_id)
+
+        # Step 2: Extract TOC from content
+        print("🔍 Step 2: Extracting TOC from content...")
+        toc_result = await extract_toc_with_gemini(all_content)
         
         if not toc_result or not toc_result.get('toc'):
             raise HTTPException(
@@ -1521,7 +1387,7 @@ async def process_docs_folder():
         
         # Step 3: Generate headings using Gemini based on TOC
         print("🤖 Step 3: Generating headings using Gemini...")
-        gemini_headings = await generate_headings_with_openai(toc_result)
+        gemini_headings = await generate_headings_with_gemini(toc_result)
         
         # Step 4: Parse and organize headings in nested format
         print("📋 Step 4: Organizing headings in nested format...")
@@ -1549,7 +1415,6 @@ async def process_docs_folder():
             "message": f"Successfully processed {len(pdf_file_contents)} PDF files from docs folder",
             "extracted_headings": nested_headings,
             "gemini_suggestions": parsed_gemini,
-            "vector_store_id": vector_store_id,
             "toc_result": toc_result,
             "files_processed": list(pdf_file_contents.keys())
         }
@@ -1664,20 +1529,20 @@ async def generate_gemini_headings(request: Dict[str, Any]):
                 status_code=400,
                 detail="No transcript text provided"
             )
-        # Generate headings using OpenAI with meeting transcript
-        print(f"🔍 Calling generate_headings_with_openai with transcript length: {len(transcript_text)}")
-        openai_headings = await generate_headings_with_openai({"toc": transcript_text})
-        print(f"🔍 generate_headings_with_openai returned: {openai_headings}")
+        # Generate headings using Gemini with meeting transcript
+        print(f"🔍 Calling generate_headings_with_gemini with transcript length: {len(transcript_text)}")
+        openai_headings = await generate_headings_with_gemini({"toc": transcript_text})
+        print(f"🔍 generate_headings_with_gemini returned: {openai_headings}")
         if openai_headings and openai_headings.get('openai_headings'):
             raw_headings = openai_headings['openai_headings']
             print(f"🔍 Raw openai_headings type: {type(raw_headings)}")
             print(f"🔍 Raw openai_headings: {raw_headings}")
-            # Handle both dictionary (fallback) and string (actual OpenAI response) cases
+            # Handle both dictionary (fallback) and string (actual Gemini response) cases
             if isinstance(raw_headings, dict):
                 print("✅ Using fallback sample headings (no API key)")
                 parsed_headings = raw_headings
             else:
-                print("✅ Parsing actual OpenAI response")
+                print("✅ Parsing actual Gemini response")
                 parsed_headings = parse_gemini_headings(raw_headings)
             print(f"✅ Final parsed headings result: {len(parsed_headings)} keys")
             print(f"✅ Parsed headings keys: {list(parsed_headings.keys())}")
@@ -1691,13 +1556,13 @@ async def generate_gemini_headings(request: Dict[str, Any]):
             return {
                 "success": False,
                 "gemini_headings": {},
-                "message": "Failed to generate OpenAI headings"
+                "message": "Failed to generate Gemini headings"
             }
     except Exception as e:
-        print(f"❌ Failed to generate OpenAI headings: {str(e)}")
+        print(f"❌ Failed to generate Gemini headings: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to generate OpenAI headings: {str(e)}"
+            detail=f"Failed to generate Gemini headings: {str(e)}"
         )
 
 @app.post("/generate-content")
@@ -1715,7 +1580,7 @@ async def generate_content_for_headings(request: Dict[str, Any]):
             )
         
         # For now, we'll simulate content generation
-        # In a real implementation, you'd use OpenAI with vector store
+        # In a real implementation, you'd use Gemini with document context
         generated_content = {}
         
         for heading in selected_headings:
@@ -1927,19 +1792,19 @@ async def process_docs_folder_toc():
                 detail="Failed to load any PDF files"
             )
         
-        # Step 1: Store PDFs in OpenAI Vector Store
-        print("📤 Step 1: Storing PDFs in OpenAI Vector Store...")
-        vector_store_id = await store_pdfs_in_vector_store(pdf_file_contents)
-        
-        if not vector_store_id:
+        # Step 1: Process PDFs with Gemini
+        print("📤 Step 1: Processing PDFs with Gemini...")
+        all_content = await process_pdfs_with_gemini(pdf_file_contents)
+
+        if not all_content:
             raise HTTPException(
                 status_code=500,
-                detail="Failed to create vector store"
+                detail="Failed to process PDFs"
             )
-        
-        # Step 2: Extract TOC from stored content
-        print("🔍 Step 2: Extracting TOC from stored content...")
-        toc_result = await extract_toc_from_vector_store(vector_store_id)
+
+        # Step 2: Extract TOC from content
+        print("🔍 Step 2: Extracting TOC from content...")
+        toc_result = await extract_toc_with_gemini(all_content)
         
         if not toc_result or not toc_result.get('toc'):
             raise HTTPException(
@@ -1965,7 +1830,6 @@ async def process_docs_folder_toc():
             "success": True,
             "message": f"Successfully extracted TOC from {len(pdf_file_contents)} PDF files",
             "extracted_headings": nested_headings,
-            "vector_store_id": vector_store_id,
             "toc_result": toc_result,
             "files_processed": list(pdf_file_contents.keys())
         }
@@ -2083,7 +1947,1337 @@ async def generate_ai_headings(request: Dict[str, Any]):
             detail=f"Failed to generate AI headings: {str(e)}"
         )
 
+# ============================================================================
+# DIAGRAM EDITING ENDPOINTS
+# ============================================================================
+
+class DiagramEditRequest(BaseModel):
+    mermaid_code: str
+    diagram_type: str
+    theme: Optional[str] = "default"
+    custom_styles: Optional[Dict[str, Any]] = None
+
+class DiagramExportRequest(BaseModel):
+    mermaid_code: str
+    format: str  # 'png', 'svg', 'pdf', 'mermaid'
+    theme: Optional[str] = "default"
+    width: Optional[int] = 800
+    height: Optional[int] = 600
+
+@app.post("/api/diagram/validate")
+async def validate_diagram(request: DiagramEditRequest):
+    """Validate Mermaid diagram syntax"""
+    try:
+        from logic.srs_generator import convert_mermaid_to_png
+        import tempfile
+
+        # Test if the Mermaid code is valid by trying to convert it
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+            temp_path = temp_file.name
+
+        try:
+            success = convert_mermaid_to_png(request.mermaid_code, temp_path)
+
+            # Clean up
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+            return {
+                "valid": success,
+                "message": "Diagram syntax is valid" if success else "Invalid Mermaid syntax"
+            }
+        except Exception as e:
+            return {
+                "valid": False,
+                "message": f"Validation error: {str(e)}"
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
+
+@app.post("/api/diagram/export")
+async def export_diagram(request: DiagramExportRequest):
+    """Export diagram in various formats"""
+    try:
+        print(f"🎯 Export request received:")
+        print(f"   Format: '{request.format}'")
+        print(f"   Mermaid code length: {len(request.mermaid_code)} characters")
+        print(f"   Theme: {request.theme}")
+
+        from logic.srs_generator import convert_mermaid_to_png
+        import tempfile
+        import base64
+
+        if request.format == 'mermaid':
+            # Return raw Mermaid code
+            return {
+                "success": True,
+                "data": request.mermaid_code,
+                "filename": "diagram.mmd",
+                "content_type": "text/plain"
+            }
+
+        elif request.format == 'png':
+            # Convert to PNG
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                temp_path = temp_file.name
+
+            try:
+                success = convert_mermaid_to_png(request.mermaid_code, temp_path)
+
+                if success and os.path.exists(temp_path):
+                    # Read the PNG file and encode as base64
+                    with open(temp_path, 'rb') as f:
+                        png_data = base64.b64encode(f.read()).decode('utf-8')
+
+                    # Clean up
+                    os.unlink(temp_path)
+
+                    return {
+                        "success": True,
+                        "data": png_data,
+                        "filename": "diagram.png",
+                        "content_type": "image/png"
+                    }
+                else:
+                    raise HTTPException(status_code=400, detail="Failed to generate PNG")
+
+            except Exception as e:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise e
+
+        elif request.format == 'svg':
+            # For SVG, we'll need to use mmdc with SVG output
+            import subprocess
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.mmd', delete=False) as mmd_file:
+                mmd_file.write(request.mermaid_code)
+                mmd_path = mmd_file.name
+
+            with tempfile.NamedTemporaryFile(suffix='.svg', delete=False) as svg_file:
+                svg_path = svg_file.name
+
+            try:
+                # Try to find mmdc
+                mmdc_cmd = None
+                for cmd in ['mmdc', 'mmdc.cmd', 'npx mmdc']:
+                    try:
+                        if cmd.startswith('npx'):
+                            test_cmd = cmd.split() + ['--version']
+                            result = subprocess.run(test_cmd, capture_output=True, timeout=10)
+                        else:
+                            result = subprocess.run([cmd, '--version'], capture_output=True, timeout=10)
+                        if result.returncode == 0:
+                            mmdc_cmd = cmd
+                            break
+                    except:
+                        continue
+
+                if not mmdc_cmd:
+                    raise HTTPException(status_code=500, detail="Mermaid CLI not found")
+
+                # Convert to SVG
+                if mmdc_cmd.startswith('npx'):
+                    cmd = mmdc_cmd.split() + ['-i', mmd_path, '-o', svg_path]
+                else:
+                    cmd = [mmdc_cmd, '-i', mmd_path, '-o', svg_path]
+                result = subprocess.run(cmd, capture_output=True, timeout=30)
+
+                if result.returncode == 0 and os.path.exists(svg_path):
+                    with open(svg_path, 'r', encoding='utf-8') as f:
+                        svg_data = f.read()
+
+                    # Clean up
+                    os.unlink(mmd_path)
+                    os.unlink(svg_path)
+
+                    return {
+                        "success": True,
+                        "data": svg_data,
+                        "filename": "diagram.svg",
+                        "content_type": "image/svg+xml"
+                    }
+                else:
+                    raise HTTPException(status_code=400, detail="Failed to generate SVG")
+
+            except Exception as e:
+                # Clean up
+                if os.path.exists(mmd_path):
+                    os.unlink(mmd_path)
+                if os.path.exists(svg_path):
+                    os.unlink(svg_path)
+                raise e
+
+        elif request.format == 'xml':
+            # Clean XML export that preserves original diagram
+            try:
+                print(f"🔄 Creating clean XML export...")
+                print(f"📋 Received Mermaid code ({len(request.mermaid_code)} chars):")
+                print(f"   First 200 chars: {request.mermaid_code[:200]}...")
+                print(f"   Last 100 chars: ...{request.mermaid_code[-100:]}")
+
+                xml_content = create_clean_xml_export(request.mermaid_code)
+                print(f"✅ XML content created: {len(xml_content)} characters")
+
+                # Also log the first part of the XML to verify it's correct
+                xml_lines = xml_content.split('\n')[:15]
+                print(f"📄 XML preview (first 15 lines):")
+                for i, line in enumerate(xml_lines, 1):
+                    print(f"   {i:2d}: {line}")
+
+                return {
+                    "success": True,
+                    "data": xml_content,
+                    "filename": "diagram.xml",
+                    "content_type": "application/xml"
+                }
+            except Exception as xml_error:
+                print(f"❌ XML export error: {str(xml_error)}")
+                raise HTTPException(status_code=500, detail=f"XML export failed: {str(xml_error)}")
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported format: {request.format}. Supported: png, svg, mermaid, xml")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+# Draw.io conversion functions removed
+
+# All Draw.io conversion functions removed to clean up codebase
+
+@app.get("/api/diagram/themes")
+async def get_diagram_themes():
+    """Get available diagram themes"""
+    return {
+        "themes": [
+            {"id": "default", "name": "Default", "description": "Standard Mermaid theme"},
+            {"id": "dark", "name": "Dark", "description": "Dark theme with light text"},
+            {"id": "forest", "name": "Forest", "description": "Green forest theme"},
+            {"id": "base", "name": "Base", "description": "Minimal base theme"},
+            {"id": "neutral", "name": "Neutral", "description": "Neutral color scheme"}
+        ]
+    }
+
+# All remaining Draw.io functions removed
+
+# Duplicate removed - using the one above
+
+@app.get("/api/document/{document_id}/diagrams")
+async def get_document_diagrams(document_id: str):
+    """Get all diagrams for a specific document"""
+    try:
+        print(f"🔍 Fetching diagrams for document ID: {document_id}")
+        print(f"📊 Available document IDs: {list(document_diagrams.keys())}")
+
+        diagrams = document_diagrams.get(document_id, [])
+        print(f"📊 Found {len(diagrams)} diagrams for document {document_id}")
+
+        if diagrams:
+            for i, diagram in enumerate(diagrams):
+                print(f"   Diagram {i+1}: {diagram.get('sectionTitle', 'Unknown')} ({diagram.get('diagramType', 'Unknown')})")
+
+        return {
+            "success": True,
+            "diagrams": diagrams,
+            "count": len(diagrams)
+        }
+    except Exception as e:
+        print(f"❌ Error fetching diagrams: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch diagrams: {str(e)}")
+
+@app.put("/api/diagram/{diagram_id}/update")
+async def update_diagram(diagram_id: str, request: DiagramEditRequest):
+    """Update a specific diagram"""
+    try:
+        # Find and update the diagram across all documents
+        updated = False
+        for doc_id, diagrams in document_diagrams.items():
+            for i, diagram in enumerate(diagrams):
+                if diagram.get('id') == diagram_id:
+                    diagrams[i].update({
+                        'mermaidCode': request.mermaid_code,
+                        'diagramType': request.diagram_type,
+                        'theme': request.theme or 'default',
+                        'lastModified': datetime.now().isoformat()
+                    })
+                    updated = True
+                    break
+            if updated:
+                break
+
+        if not updated:
+            raise HTTPException(status_code=404, detail="Diagram not found")
+
+        return {"message": "Diagram updated successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update diagram: {str(e)}")
+
+@app.post("/api/diagram/{diagram_id}/export")
+async def export_diagram_by_id(diagram_id: str, export_format: str = "png"):
+    """Export a specific diagram by ID"""
+    try:
+        # Find the diagram
+        diagram = None
+        for doc_id, diagrams in document_diagrams.items():
+            for d in diagrams:
+                if d.get('id') == diagram_id:
+                    diagram = d
+                    break
+            if diagram:
+                break
+
+        if not diagram:
+            raise HTTPException(status_code=404, detail="Diagram not found")
+
+        mermaid_code = diagram.get('mermaidCode', '')
+        if not mermaid_code:
+            raise HTTPException(status_code=400, detail="No Mermaid code found for diagram")
+
+        # Export based on format
+        if export_format.lower() == 'png':
+            from logic.srs_generator import convert_mermaid_to_png
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
+                temp_path = temp_file.name
+
+            success = convert_mermaid_to_png(mermaid_code, temp_path)
+
+            if success and os.path.exists(temp_path):
+                with open(temp_path, 'rb') as f:
+                    png_data = f.read()
+                os.unlink(temp_path)
+
+                from fastapi.responses import Response
+                return Response(
+                    content=png_data,
+                    media_type="image/png",
+                    headers={"Content-Disposition": f"attachment; filename={diagram_id}.png"}
+                )
+            else:
+                raise HTTPException(status_code=500, detail="Failed to generate PNG")
+
+        elif export_format.lower() == 'svg':
+            from logic.srs_generator import convert_mermaid_to_svg
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(suffix='.svg', delete=False) as temp_file:
+                temp_path = temp_file.name
+
+            success = convert_mermaid_to_svg(mermaid_code, temp_path)
+
+            if success and os.path.exists(temp_path):
+                with open(temp_path, 'r', encoding='utf-8') as f:
+                    svg_data = f.read()
+                os.unlink(temp_path)
+
+                from fastapi.responses import Response
+                return Response(
+                    content=svg_data,
+                    media_type="image/svg+xml",
+                    headers={"Content-Disposition": f"attachment; filename={diagram_id}.svg"}
+                )
+            else:
+                raise HTTPException(status_code=500, detail="Failed to generate SVG")
+
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported export format. Use 'png' or 'svg'")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+# Duplicate export endpoint removed - XML support added to the main endpoint above
+
+def create_clean_xml_export(mermaid_code: str) -> str:
+    """
+    Create a clean XML export that preserves the original Mermaid diagram
+    This does NOT convert or spoil the diagram - just wraps it in XML format
+    """
+    try:
+        from datetime import datetime
+        import html
+
+        # Escape the Mermaid code for XML (using html.escape which is more reliable)
+        escaped_mermaid = html.escape(mermaid_code)
+
+        # Create simple XML structure that preserves the original diagram
+        xml_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<diagram>
+    <metadata>
+        <title>Mermaid Diagram Export</title>
+        <created>{datetime.now().isoformat()}</created>
+        <format>mermaid</format>
+        <description>Clean XML export preserving original Mermaid diagram</description>
+    </metadata>
+    <content type="mermaid"><![CDATA[{mermaid_code}]]></content>
+    <display>
+        <mermaid_code>{escaped_mermaid}</mermaid_code>
+    </display>
+</diagram>'''
+
+        return xml_content
+
+    except Exception as e:
+        print(f"❌ Error creating XML export: {str(e)}")
+        # Return a simple fallback XML if there's an error
+        return f'''<?xml version="1.0" encoding="UTF-8"?>
+<diagram>
+    <metadata>
+        <title>Mermaid Diagram Export</title>
+        <format>mermaid</format>
+        <error>Error creating full XML: {str(e)}</error>
+    </metadata>
+    <content type="mermaid"><![CDATA[{mermaid_code}]]></content>
+</diagram>'''
+
+def parse_mermaid_for_drawio(mermaid_code: str) -> dict:
+    """Parse Mermaid code to extract elements for Draw.io with better layout"""
+    elements = {
+        'nodes': [],
+        'connections': [],
+        'type': 'flowchart'
+    }
+
+    lines = mermaid_code.strip().split('\n')
+    nodes_dict = {}
+    connections = []
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('%%') or line.startswith('Title:') or line.startswith('participant'):
+            continue
+
+        # Detect diagram type
+        if line.startswith('flowchart') or line.startswith('graph'):
+            elements['type'] = 'flowchart'
+        elif line.startswith('sequenceDiagram'):
+            elements['type'] = 'sequence'
+        elif line.startswith('erDiagram'):
+            elements['type'] = 'er'
+
+        # Parse connections and extract nodes
+        if '-->' in line or '->' in line or '---' in line:
+            # Split on arrow types
+            arrow_pattern = '-->'
+            if '-->' in line:
+                arrow_pattern = '-->'
+            elif '->' in line:
+                arrow_pattern = '->'
+            elif '---' in line:
+                arrow_pattern = '---'
+
+            parts = line.split(arrow_pattern)
+            if len(parts) >= 2:
+                source_part = parts[0].strip()
+                target_part = parts[1].strip()
+
+                # Extract source node
+                source_id, source_text = extract_node_info(source_part)
+                if source_id and source_id not in nodes_dict:
+                    nodes_dict[source_id] = {
+                        'id': source_id,
+                        'text': source_text or source_id,
+                        'type': determine_node_type(source_text or source_id)
+                    }
+
+                # Extract target node
+                target_id, target_text = extract_node_info(target_part)
+                if target_id and target_id not in nodes_dict:
+                    nodes_dict[target_id] = {
+                        'id': target_id,
+                        'text': target_text or target_id,
+                        'type': determine_node_type(target_text or target_id)
+                    }
+
+                # Add connection
+                if source_id and target_id:
+                    connections.append({
+                        'source': source_id,
+                        'target': target_id,
+                        'type': 'arrow'
+                    })
+
+    # Convert to list and calculate positions
+    nodes_list = list(nodes_dict.values())
+    positioned_nodes = calculate_smart_layout(nodes_list, connections, elements['type'])
+
+    elements['nodes'] = positioned_nodes
+    elements['connections'] = connections
+
+    return elements
+
+def extract_node_info(node_text: str) -> tuple:
+    """Extract node ID and display text from Mermaid node definition"""
+    node_text = node_text.strip()
+
+    # Handle different node formats: A[Text], A(Text), A{Text}, etc.
+    if '[' in node_text and ']' in node_text:
+        parts = node_text.split('[', 1)
+        node_id = parts[0].strip()
+        display_text = parts[1].split(']')[0].strip()
+        return node_id, display_text
+    elif '(' in node_text and ')' in node_text:
+        parts = node_text.split('(', 1)
+        node_id = parts[0].strip()
+        display_text = parts[1].split(')')[0].strip()
+        return node_id, display_text
+    elif '{' in node_text and '}' in node_text:
+        parts = node_text.split('{', 1)
+        node_id = parts[0].strip()
+        display_text = parts[1].split('}')[0].strip()
+        return node_id, display_text
+    else:
+        # Simple node ID
+        return node_text, node_text
+
+def determine_node_type(text: str) -> str:
+    """Determine the appropriate node type based on text content"""
+    text_lower = text.lower()
+
+    if any(word in text_lower for word in ['start', 'begin', 'init']):
+        return 'start'
+    elif any(word in text_lower for word in ['end', 'finish', 'complete', 'done']):
+        return 'end'
+    elif any(word in text_lower for word in ['decision', 'choice', '?', 'if', 'check']):
+        return 'decision'
+    elif any(word in text_lower for word in ['database', 'db', 'storage', 'data']):
+        return 'database'
+    elif any(word in text_lower for word in ['user', 'actor', 'person', 'client']):
+        return 'actor'
+    else:
+        return 'process'
+
+def calculate_smart_layout(nodes: list, connections: list, diagram_type: str) -> list:
+    """Calculate smart positioning for nodes to avoid overlaps"""
+    if not nodes:
+        return []
+
+    # Create a simple hierarchical layout
+    positioned_nodes = []
+
+    if diagram_type == 'sequence':
+        # Horizontal layout for sequence diagrams
+        for i, node in enumerate(nodes):
+            positioned_nodes.append({
+                **node,
+                'x': 50 + i * 180,
+                'y': 100,
+                'width': 150,
+                'height': 80
+            })
+    else:
+        # Hierarchical layout for flowcharts
+        # Find root nodes (nodes with no incoming connections)
+        incoming_counts = {}
+        for conn in connections:
+            incoming_counts[conn['target']] = incoming_counts.get(conn['target'], 0) + 1
+
+        root_nodes = [node for node in nodes if incoming_counts.get(node['id'], 0) == 0]
+        if not root_nodes:
+            root_nodes = [nodes[0]]  # Fallback to first node
+
+        # Simple grid layout with levels
+        levels = {}
+        visited = set()
+
+        def assign_level(node_id, level):
+            if node_id in visited:
+                return
+            visited.add(node_id)
+            if level not in levels:
+                levels[level] = []
+            levels[level].append(node_id)
+
+            # Find children
+            for conn in connections:
+                if conn['source'] == node_id:
+                    assign_level(conn['target'], level + 1)
+
+        # Assign levels starting from root nodes
+        for root in root_nodes:
+            assign_level(root['id'], 0)
+
+        # Position nodes based on levels
+        for node in nodes:
+            node_level = 0
+            node_position_in_level = 0
+
+            # Find which level this node is in
+            for level, level_nodes in levels.items():
+                if node['id'] in level_nodes:
+                    node_level = level
+                    node_position_in_level = level_nodes.index(node['id'])
+                    break
+
+            # Calculate position
+            x = 100 + node_position_in_level * 200
+            y = 100 + node_level * 150
+
+            positioned_nodes.append({
+                **node,
+                'x': x,
+                'y': y,
+                'width': 160,
+                'height': 80
+            })
+
+    return positioned_nodes
+
+# Old helper functions removed - using improved parsing above
+
+def generate_drawio_xml_from_elements(elements: dict) -> str:
+    """Generate Draw.io XML from parsed elements with better styling"""
+    nodes = elements.get('nodes', [])
+    connections = elements.get('connections', [])
+
+    # Start XML structure
+    xml_parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<mxfile host="app.diagrams.net" modified="2024-01-01T00:00:00.000Z" agent="SRS Dynamic Generator" version="22.1.11">',
+        '  <diagram name="Page-1" id="page-1">',
+        '    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">',
+        '      <root>',
+        '        <mxCell id="0"/>',
+        '        <mxCell id="1" parent="0"/>'
+    ]
+
+    # Create node ID mapping
+    node_id_map = {}
+
+    # Add nodes with improved styling
+    for i, node in enumerate(nodes):
+        cell_id = i + 2
+        node_id_map[node['id']] = cell_id
+
+        x = node.get('x', 100)
+        y = node.get('y', 100)
+        width = node.get('width', 160)
+        height = node.get('height', 80)
+        text = node.get('text', node.get('id', f'Node {i+1}'))
+        node_type = node.get('type', 'process')
+
+        # Choose style based on node type
+        style = get_node_style(node_type, text)
+
+        # Escape XML characters in text
+        escaped_text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+        xml_parts.append(f'        <mxCell id="{cell_id}" value="{escaped_text}" style="{style}" vertex="1" parent="1">')
+        xml_parts.append(f'          <mxGeometry x="{x}" y="{y}" width="{width}" height="{height}" as="geometry"/>')
+        xml_parts.append('        </mxCell>')
+
+    # Add connections with better styling
+    connection_id = len(nodes) + 2
+    for conn in connections:
+        source_cell_id = node_id_map.get(conn['source'])
+        target_cell_id = node_id_map.get(conn['target'])
+
+        if source_cell_id and target_cell_id:
+            xml_parts.append(f'        <mxCell id="{connection_id}" value="" style="endArrow=classic;html=1;rounded=0;strokeWidth=2;strokeColor=#333333;" edge="1" parent="1" source="{source_cell_id}" target="{target_cell_id}">')
+            xml_parts.append('          <mxGeometry width="50" height="50" relative="1" as="geometry">')
+            xml_parts.append('            <mxPoint x="390" y="180" as="sourcePoint"/>')
+            xml_parts.append('            <mxPoint x="440" y="130" as="targetPoint"/>')
+            xml_parts.append('          </mxGeometry>')
+            xml_parts.append('        </mxCell>')
+            connection_id += 1
+
+    # Close XML structure
+    xml_parts.extend([
+        '      </root>',
+        '    </mxGraphModel>',
+        '  </diagram>',
+        '</mxfile>'
+    ])
+
+    return '\n'.join(xml_parts)
+
+# Removed complex conversion functions - keeping it simple
+
+def get_node_style(node_type: str, text: str) -> str:
+    """Get appropriate Draw.io style for node type"""
+    base_style = "whiteSpace=wrap;html=1;fontSize=12;fontFamily=Helvetica;"
+
+    if node_type == 'start':
+        return f"ellipse;{base_style}fillColor=#d5e8d4;strokeColor=#82b366;fontColor=#000000;"
+    elif node_type == 'end':
+        return f"ellipse;{base_style}fillColor=#f8cecc;strokeColor=#b85450;fontColor=#000000;"
+    elif node_type == 'decision':
+        return f"rhombus;{base_style}fillColor=#fff2cc;strokeColor=#d6b656;fontColor=#000000;"
+    elif node_type == 'database':
+        return f"shape=cylinder3;{base_style}fillColor=#e1d5e7;strokeColor=#9673a6;fontColor=#000000;"
+    elif node_type == 'actor':
+        return f"shape=umlActor;{base_style}fillColor=#f8cecc;strokeColor=#b85450;fontColor=#000000;"
+    else:
+        # Default process node
+        return f"rounded=1;{base_style}fillColor=#dae8fc;strokeColor=#6c8ebf;fontColor=#000000;"
+
+def create_default_drawio_xml() -> str:
+    """Create a default Draw.io XML when conversion fails"""
+    return '''<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" modified="2024-01-01T00:00:00.000Z" agent="SRS Dynamic Generator" version="22.1.11">
+  <diagram name="Page-1" id="page-1">
+    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="Start" style="ellipse;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="364" y="40" width="100" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="Process" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="364" y="140" width="100" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" value="End" style="ellipse;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="364" y="240" width="100" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="5" value="" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="390" y="180" as="sourcePoint"/>
+            <mxPoint x="440" y="130" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="6" value="" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="3" target="4">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="390" y="280" as="sourcePoint"/>
+            <mxPoint x="440" y="230" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>'''
+
+@app.get("/api/diagram/themes")
+async def get_diagram_themes():
+    """Get available diagram themes"""
+    return {
+        "themes": [
+            {"id": "default", "name": "Default", "description": "Standard Mermaid theme"},
+            {"id": "dark", "name": "Dark", "description": "Dark theme with light text"},
+            {"id": "forest", "name": "Forest", "description": "Green forest theme"},
+            {"id": "base", "name": "Base", "description": "Minimal base theme"},
+            {"id": "neutral", "name": "Neutral", "description": "Neutral color scheme"}
+        ]
+    }
+
+# ============================================================================
+# DOCUMENT DIAGRAM MANAGEMENT ENDPOINTS (DUPLICATE REMOVED)
+# ============================================================================
+
+# Note: document_diagrams storage is already defined above at line ~30
+
+@app.put("/api/diagram/{diagram_id}/update")
+async def update_diagram(diagram_id: str, request: DiagramEditRequest):
+    """Update a specific diagram"""
+    try:
+        # Find and update the diagram across all documents
+        updated = False
+        for doc_id, diagrams in document_diagrams.items():
+            for i, diagram in enumerate(diagrams):
+                if diagram.get('id') == diagram_id:
+                    diagrams[i].update({
+                        'mermaidCode': request.mermaid_code,
+                        'theme': request.theme,
+                        'diagramType': request.diagram_type,
+                        'lastModified': datetime.now().isoformat()
+                    })
+                    updated = True
+                    break
+            if updated:
+                break
+
+        if not updated:
+            raise HTTPException(status_code=404, detail="Diagram not found")
+
+        return {
+            "success": True,
+            "message": "Diagram updated successfully"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update diagram: {str(e)}")
+
+# ============================================================================
+# SIMPLE DIAGRAM ENDPOINTS
+# ============================================================================
+
+# ============================================================================
+# DOCUMENT REGENERATION
+# ============================================================================
+
+@app.post("/api/document/{document_id}/regenerate")
+async def regenerate_document_with_diagrams(document_id: str):
+    """Regenerate document with updated diagrams"""
+    try:
+        from logic.srs_generator import generate_srs_docx
+
+        # Get document info (in production, fetch from database)
+        if document_id not in generated_files:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Get updated diagrams
+        diagrams = document_diagrams.get(document_id, [])
+
+        # Create new output file
+        output_dir = os.path.join(os.getcwd(), 'generated_docs')
+        os.makedirs(output_dir, exist_ok=True)
+
+        output_filename = f"updated_srs_{document_id}.docx"
+        output_path = os.path.join(output_dir, output_filename)
+
+        # Regenerate with updated diagrams
+        headings = [
+            {
+                'heading': diagram['sectionTitle'],
+                'purpose': 'Updated section with custom diagram',
+                'category': 'Custom',
+                'source': 'User Modified',
+                'userPrompt': f"Use this custom diagram: {diagram['mermaidCode']}"
+            }
+            for diagram in diagrams
+        ]
+
+        if headings:
+            generate_srs_docx(headings, output_path, "")
+        else:
+            generate_srs_docx([], output_path, "")
+
+        return FileResponse(
+            path=output_path,
+            filename=output_filename,
+            media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate document: {str(e)}")
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def convert_to_drawio_format(elements):
+    """Convert parsed elements to Draw.io format"""
+    return {
+        "type": "drawio",
+        "cells": [
+            {
+                "id": node['id'],
+                "value": node['text'],
+                "style": "rounded=1;whiteSpace=wrap;html=1;",
+                "vertex": 1,
+                "geometry": {
+                    "x": node['x'],
+                    "y": node['y'],
+                    "width": node['width'],
+                    "height": node['height']
+                }
+            }
+            for node in elements['nodes']
+        ]
+    }
+
+def convert_visual_to_mermaid(visual_data: dict, source_format: str) -> str:
+    """Convert visual editor data back to Mermaid code"""
+    try:
+        if source_format == 'excalidraw':
+            return convert_excalidraw_to_mermaid(visual_data)
+        else:
+            return convert_generic_to_mermaid(visual_data)
+    except Exception as e:
+        print(f"❌ Conversion back error: {str(e)}")
+        return "flowchart TD\n    A[Start] --> B[End]"
+
+def convert_excalidraw_to_mermaid(visual_data: dict) -> str:
+    """Convert Excalidraw data back to Mermaid"""
+    elements = visual_data.get('elements', [])
+
+    # Extract rectangles (nodes) and arrows (connections)
+    nodes = []
+    connections = []
+
+    for element in elements:
+        if element.get('type') == 'rectangle':
+            node_id = element.get('id', '').replace('node_', '')
+            node_text = element.get('text', node_id)
+            nodes.append({'id': node_id, 'text': node_text})
+        elif element.get('type') == 'arrow':
+            arrow_id = element.get('id', '')
+            if '_' in arrow_id:
+                parts = arrow_id.replace('arrow_', '').split('_')
+                if len(parts) >= 2:
+                    connections.append({'source': parts[0], 'target': parts[1]})
+
+    # Generate Mermaid code
+    mermaid_lines = ["flowchart TD"]
+
+    for node in nodes:
+        mermaid_lines.append(f"    {node['id']}[\"{node['text']}\"]")
+
+    for conn in connections:
+        mermaid_lines.append(f"    {conn['source']} --> {conn['target']}")
+
+    return '\n'.join(mermaid_lines)
+
+@app.post("/api/diagram/generate-ai")
+async def generate_diagram_with_ai(request: dict):
+    """Generate diagram using AI based on user prompt"""
+    try:
+        prompt = request.get('prompt', '')
+        diagram_type = request.get('diagramType', 'flowchart')
+        format_type = request.get('format', 'mermaid')
+
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Prompt is required")
+
+        # Generate Mermaid code using AI
+        mermaid_code = await generate_mermaid_with_ai(prompt, diagram_type)
+
+        return {
+            "success": True,
+            "mermaidCode": mermaid_code,
+            "prompt": prompt,
+            "diagramType": diagram_type
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI generation failed: {str(e)}")
+
+async def generate_mermaid_with_ai(prompt: str, diagram_type: str) -> str:
+    """Generate Mermaid diagram code using AI"""
+    try:
+        # Enhanced prompt for better diagram generation
+        system_prompt = f"""You are an expert in creating {diagram_type} diagrams using Mermaid syntax.
+
+Generate a well-structured Mermaid diagram based on the user's request. Follow these guidelines:
+
+1. Use proper Mermaid syntax for {diagram_type} diagrams
+2. Include meaningful node labels and connections
+3. Use appropriate shapes and styling
+4. Make the diagram clear and professional
+5. Include proper spacing and organization
+
+For flowcharts: Use flowchart TD or LR syntax
+For sequence diagrams: Use sequenceDiagram syntax
+For ER diagrams: Use erDiagram syntax
+For class diagrams: Use classDiagram syntax
+
+Return ONLY the Mermaid code, no explanations or markdown formatting."""
+
+        user_prompt = f"Create a {diagram_type} diagram for: {prompt}"
+
+        # Use Gemini API for diagram generation
+        try:
+            import google.generativeai as genai
+            import os
+
+            # Configure Gemini API
+            genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+            model = genai.GenerativeModel('gemini-pro')
+
+            # Combine system and user prompts for Gemini
+            full_prompt = f"{system_prompt}\n\nUser Request: {user_prompt}"
+
+            response = model.generate_content(full_prompt)
+            ai_response = response.text
+
+            # Clean up the response to ensure it's valid Mermaid code
+            mermaid_code = clean_mermaid_code(ai_response, diagram_type)
+
+        except Exception as gemini_error:
+            print(f"Gemini API error: {gemini_error}")
+            # Fallback to smart pattern-based generation
+            mermaid_code = generate_smart_diagram_local(prompt, diagram_type)
+
+        return mermaid_code
+
+    except Exception as e:
+        print(f"❌ AI generation error: {str(e)}")
+        return generate_fallback_diagram(prompt, diagram_type)
+
+def clean_mermaid_code(raw_code: str, diagram_type: str) -> str:
+    """Clean and validate Mermaid code"""
+    # Remove markdown formatting
+    code = raw_code.strip()
+    if code.startswith('```'):
+        lines = code.split('\n')
+        code = '\n'.join(lines[1:-1]) if len(lines) > 2 else code
+
+    # Remove any extra formatting
+    code = code.replace('```mermaid', '').replace('```', '').strip()
+
+    # Ensure proper diagram type declaration
+    if not any(code.startswith(dt) for dt in ['flowchart', 'graph', 'sequenceDiagram', 'erDiagram', 'classDiagram']):
+        if diagram_type == 'flowchart':
+            code = f"flowchart TD\n{code}"
+        elif diagram_type == 'sequence':
+            code = f"sequenceDiagram\n{code}"
+        elif diagram_type == 'er':
+            code = f"erDiagram\n{code}"
+        elif diagram_type == 'class':
+            code = f"classDiagram\n{code}"
+
+    return code
+
+def generate_smart_diagram_local(prompt: str, diagram_type: str) -> str:
+    """Generate smart diagrams using local pattern matching and templates"""
+    prompt_lower = prompt.lower()
+
+    # Smart keyword detection for different diagram types
+    if diagram_type == 'sequence' or 'sequence' in prompt_lower or 'flow' in prompt_lower:
+        return generate_smart_sequence_diagram(prompt)
+    elif diagram_type == 'er' or 'database' in prompt_lower or 'entity' in prompt_lower:
+        return generate_smart_er_diagram(prompt)
+    elif diagram_type == 'class' or 'class' in prompt_lower or 'object' in prompt_lower:
+        return generate_smart_class_diagram(prompt)
+    else:
+        return generate_smart_flowchart(prompt)
+
+def generate_smart_sequence_diagram(prompt: str) -> str:
+    """Generate intelligent sequence diagrams based on prompt analysis"""
+    prompt_lower = prompt.lower()
+
+    # Detect common patterns
+    if 'auth' in prompt_lower or 'login' in prompt_lower:
+        return """sequenceDiagram
+    participant U as User
+    participant F as Frontend
+    participant A as Auth Service
+    participant D as Database
+
+    U->>F: Enter credentials
+    F->>A: Validate login
+    A->>D: Check user data
+    D-->>A: User found
+    A-->>F: Generate token
+    F-->>U: Login successful
+
+    Note over U,D: Authentication Flow"""
+
+    elif 'payment' in prompt_lower or 'checkout' in prompt_lower:
+        return """sequenceDiagram
+    participant U as User
+    participant S as Shop
+    participant P as Payment Gateway
+    participant B as Bank
+
+    U->>S: Select items
+    S->>U: Show checkout
+    U->>P: Enter payment details
+    P->>B: Process payment
+    B-->>P: Payment confirmed
+    P-->>S: Payment success
+    S-->>U: Order confirmed"""
+
+    elif 'api' in prompt_lower or 'request' in prompt_lower:
+        return """sequenceDiagram
+    participant C as Client
+    participant A as API Gateway
+    participant S as Service
+    participant D as Database
+
+    C->>A: API Request
+    A->>S: Route request
+    S->>D: Query data
+    D-->>S: Return results
+    S-->>A: Process response
+    A-->>C: API Response"""
+
+    else:
+        # Generic sequence based on prompt
+        words = prompt.split()[:4]
+        return f"""sequenceDiagram
+    participant User
+    participant System
+    participant Service
+    participant Database
+
+    User->>System: {' '.join(words)}
+    System->>Service: Process request
+    Service->>Database: Store/Retrieve data
+    Database-->>Service: Data response
+    Service-->>System: Result
+    System-->>User: Final response"""
+
+def generate_smart_flowchart(prompt: str) -> str:
+    """Generate intelligent flowcharts based on prompt analysis"""
+    prompt_lower = prompt.lower()
+
+    if 'decision' in prompt_lower or 'if' in prompt_lower or 'choose' in prompt_lower:
+        return f"""flowchart TD
+    A[Start: {prompt[:30]}] --> B{{Decision Point}}
+    B -->|Yes| C[Option A]
+    B -->|No| D[Option B]
+    C --> E[Process A]
+    D --> F[Process B]
+    E --> G[End]
+    F --> G"""
+
+    elif 'process' in prompt_lower or 'workflow' in prompt_lower:
+        return f"""flowchart LR
+    A[Input] --> B[Validate]
+    B --> C[Process]
+    C --> D[Transform]
+    D --> E[Output]
+
+    B -->|Invalid| F[Error Handling]
+    F --> A"""
+
+    elif 'system' in prompt_lower or 'architecture' in prompt_lower:
+        return f"""flowchart TB
+    subgraph "Frontend"
+        UI[User Interface]
+        APP[Application]
+    end
+
+    subgraph "Backend"
+        API[API Layer]
+        BL[Business Logic]
+    end
+
+    subgraph "Data"
+        DB[(Database)]
+        CACHE[(Cache)]
+    end
+
+    UI --> API
+    APP --> API
+    API --> BL
+    BL --> DB
+    BL --> CACHE"""
+
+    else:
+        # Generic flowchart
+        return f"""flowchart TD
+    A[Start] --> B[{prompt[:20]}]
+    B --> C{{Process}}
+    C -->|Success| D[Complete]
+    C -->|Error| E[Handle Error]
+    E --> B
+    D --> F[End]"""
+
+def generate_smart_er_diagram(prompt: str) -> str:
+    """Generate intelligent ER diagrams based on prompt analysis"""
+    prompt_lower = prompt.lower()
+
+    if 'user' in prompt_lower or 'customer' in prompt_lower:
+        return """erDiagram
+    USER {
+        int id PK
+        string name
+        string email
+        string password
+        datetime created_at
+    }
+
+    PROFILE {
+        int id PK
+        int user_id FK
+        string first_name
+        string last_name
+        string phone
+    }
+
+    ORDER {
+        int id PK
+        int user_id FK
+        decimal total
+        datetime order_date
+        string status
+    }
+
+    USER ||--|| PROFILE : has
+    USER ||--o{ ORDER : places"""
+
+    elif 'product' in prompt_lower or 'inventory' in prompt_lower:
+        return """erDiagram
+    PRODUCT {
+        int id PK
+        string name
+        string description
+        decimal price
+        int stock_quantity
+    }
+
+    CATEGORY {
+        int id PK
+        string name
+        string description
+    }
+
+    ORDER_ITEM {
+        int id PK
+        int product_id FK
+        int order_id FK
+        int quantity
+        decimal unit_price
+    }
+
+    CATEGORY ||--o{ PRODUCT : contains
+    PRODUCT ||--o{ ORDER_ITEM : included_in"""
+
+    else:
+        # Generic ER diagram
+        return """erDiagram
+    ENTITY_A {
+        int id PK
+        string name
+        datetime created_at
+    }
+
+    ENTITY_B {
+        int id PK
+        int entity_a_id FK
+        string description
+        string status
+    }
+
+    ENTITY_A ||--o{ ENTITY_B : has"""
+
+def generate_smart_class_diagram(prompt: str) -> str:
+    """Generate intelligent class diagrams based on prompt analysis"""
+    prompt_lower = prompt.lower()
+
+    if 'user' in prompt_lower or 'auth' in prompt_lower:
+        return """classDiagram
+    class User {
+        +int id
+        +string username
+        +string email
+        +string password
+        +datetime createdAt
+        +login(credentials)
+        +logout()
+        +updateProfile(data)
+        +validatePassword(password)
+    }
+
+    class UserProfile {
+        +int userId
+        +string firstName
+        +string lastName
+        +string phone
+        +string address
+        +updateProfile(data)
+        +getFullName()
+    }
+
+    class Session {
+        +string sessionId
+        +int userId
+        +datetime expiresAt
+        +boolean isValid()
+        +refresh()
+    }
+
+    User ||--|| UserProfile : has
+    User ||--o{ Session : creates"""
+
+    else:
+        # Generic class diagram
+        return """classDiagram
+    class BaseClass {
+        +int id
+        +string name
+        +datetime createdAt
+        +save()
+        +delete()
+        +validate()
+    }
+
+    class DerivedClass {
+        +string description
+        +string status
+        +process()
+        +update(data)
+    }
+
+    BaseClass <|-- DerivedClass : inherits"""
+
+def generate_fallback_diagram(prompt: str, diagram_type: str) -> str:
+    """Generate a fallback diagram when all else fails"""
+    return generate_smart_diagram_local(prompt, diagram_type)
+
+def convert_generic_to_mermaid(visual_data: dict) -> str:
+    """Convert generic visual data to Mermaid"""
+    nodes = visual_data.get('nodes', [])
+    connections = visual_data.get('connections', [])
+
+    mermaid_lines = ["flowchart TD"]
+
+    # Add node definitions
+    for node in nodes:
+        node_id = node['id']
+        node_text = node.get('text', node_id)
+        mermaid_lines.append(f"    {node_id}[\"{node_text}\"]")
+
+    # Add connections
+    for conn in connections:
+        source = conn['source']
+        target = conn['target']
+        mermaid_lines.append(f"    {source} --> {target}")
+
+    return '\n'.join(mermaid_lines)
+
+@app.post("/api/document/{document_id}/regenerate")
+async def regenerate_document_with_diagrams(document_id: str):
+    """Regenerate document with updated diagrams"""
+    try:
+        from logic.srs_generator import generate_srs_docx
+
+        # Get document info (in production, fetch from database)
+        if document_id not in generated_files:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        # Get updated diagrams
+        diagrams = document_diagrams.get(document_id, [])
+
+        # Create new output file
+        output_dir = os.path.join(os.getcwd(), 'generated_docs')
+        os.makedirs(output_dir, exist_ok=True)
+
+        output_filename = f"updated_srs_{document_id}.docx"
+        output_path = os.path.join(output_dir, output_filename)
+
+        # Regenerate with updated diagrams
+        headings = [
+            {
+                'heading': diagram['sectionTitle'],
+                'purpose': 'Updated section with custom diagram',
+                'category': 'Custom',
+                'source': 'User Modified',
+                'userPrompt': f"Use this custom diagram: {diagram['mermaidCode']}"
+            }
+            for diagram in diagrams
+        ]
+
+        if headings:
+            generate_srs_docx(headings, output_path, "")
+        else:
+            generate_srs_docx([], output_path, "")
+
+        return FileResponse(
+            path=output_path,
+            filename=output_filename,
+            media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate document: {str(e)}")
+
 if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
+
+# ============================================================================
+# SERVER STARTUP
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(
         "main:app",
         host="127.0.0.1",

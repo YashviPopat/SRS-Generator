@@ -106,14 +106,10 @@ const UploadArea = ({ onFilesUploaded, uploadedFiles, acceptedFileTypes }) => {
         <p className="text-lg font-medium text-gray-900 mb-2">
           {isDragActive ? 'Drop files here...' : 'Drag & drop files here'}
         </p>
-        <p className="text-gray-600 mb-4">
-          or click to select files
-        </p>
         <div className="text-sm text-gray-500">
           <p>Supported formats: PDF, DOCX, DOC, TXT, MD</p>
           <p>Maximum file size: 10MB</p>
           <p className="text-blue-600 font-medium mt-2">
-            Files will be processed when you click "Generate Headings"
           </p>
         </div>
       </div>
