@@ -28,31 +28,13 @@
       "Communication/Security": "Security protocols and communication standards.",
       "System Integration": "Integration with external/internal systems.",
       "Constraints and Limitation": "Known system limitations.",
-      "Legal": {
-        "Data Protection and Privacy": "Data handling policies.",
-        "Liability Limitation": "Liability coverage terms."
-      }
+      "Legal": "Data Protection and Privacy"
     },
     "System Architecture": {
       "Overview": "Top-level system architecture view.",
-      "AI Subsystems": {
-        "Router & Orchestration Layer": "Flow control for AI subsystems.",
-        "Knowledge-Centric Q&A Route": "Handle Q&A using knowledge base.",
-        "Fallback & Governance Logic": "Handle exceptions and control logic."
-      },
-      "N-tier Architecture": {
-        "Presentation Component": "User interface layer.",
-        "Business Logic Component": "Application logic layer.",
-        "Data Access Component": "Database access routines.",
-        "Communication & Security Component": "Handles secure communication.",
-        "API Component": "Exposes application interfaces."
-      },
-      "Microservices Architecture": {
-        "Key Benefits": "Advantages of using microservices.",
-        "Core Microservices and Their Responsibilities": "Individual service responsibilities.",
-        "Communication and Integration Pattern": "How services interact.",
-        "Security and Compliance (Offline-Oriented)": "Offline system security."
-      },
+      "AI Subsystems": "Router & Orchestration Layer & Flow control for AI subsystems.",
+      "N-tier Architecture": "Presentation of Business Logic,Data Access,Communication & Security & API Component",
+      "Microservices Architecture": "Key Benefits & Advantages of using microservices.",
       "Method of Development": "Development strategy or methodology.",
       "High-Level Technical Design": "Technical overview and structure."
     },

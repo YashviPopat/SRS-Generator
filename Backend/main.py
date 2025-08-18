@@ -28,7 +28,7 @@ gemini_api_key = os.getenv("GEMINI_API_KEY")
 if not gemini_api_key:
     print("⚠️ Warning: GEMINI_API_KEY not found in environment variables")
     print("💡 Please set GEMINI_API_KEY in your .env file or system environment")
-    gemini_api_key = "AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ"  # Fallback for development
+    gemini_api_key = "AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70"  # Fallback for development
 
 # Import our models and utilities
 from models.srs_model import *

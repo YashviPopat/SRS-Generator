@@ -104,6 +104,12 @@ def fix_mermaid_syntax(mermaid_code: str) -> str:
     # Step 1: Basic cleanup
     mermaid_code = mermaid_code.replace('\r\n', '\n').replace('\r', '\n').strip()
 
+    # Step 1.1: CRITICAL - Remove any ellipsis from node labels
+    # This is the most important fix to prevent "..." in diagram names
+    mermaid_code = re.sub(r'\[([^[\]]*?)\.\.\.([^[\]]*?)\]', r'[\1 \2]', mermaid_code)
+    mermaid_code = re.sub(r'\[([^[\]]*?)…([^[\]]*?)\]', r'[\1 \2]', mermaid_code)  # Unicode ellipsis
+    print(f"🔧 Removed ellipsis from node labels")
+
     # Step 2: Critical fixes (based on your analysis)
 
     # Fix 1: Remove ALL single quotes and replace with double quotes
@@ -242,7 +248,7 @@ def fix_mermaid_with_gemini(broken_code: str, error_message: str) -> str:
     try:
         import google.generativeai as genai
 
-        genai.configure(api_key="AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ")
+        genai.configure(api_key="AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70")
         model = genai.GenerativeModel('gemini-2.0-flash')
 
         prompt = f"""
@@ -666,6 +672,21 @@ def generate_sub_diagrams(heading: str, content: str, diagram_type: str, model, 
             5. Node labels must be 2-3 words maximum
             6. Use vertical layout (TD direction) for better A4 fit
             7. Focus on CORE components only, not every detail
+            
+            CRITICAL NAMING RULES (MUST FOLLOW EXACTLY):
+            1. Every node must have a meaningful, descriptive, and complete label.
+            2. Never output single-letter node names (e.g., "e" or "a").
+            Replace them with full system terms like "Engine", "Endpoint", or "Entity".
+            3. Node labels must use full words, ABSOLUTELY NO truncation or ellipsis (...) ANYWHERE.
+            4. Keep node names short (max 3 words) but fully descriptive.
+            Example: "Data Storage", "Reporting Service", "User Interface".
+            5. Avoid special characters, parentheses, commas, and periods in node labels.
+            6. Always use Title Case (capitalize first letter of each word).
+            7. If system entities are unclear, use safe defaults: "Frontend", "Backend", "Database", "Reporting Service", "API Gateway".
+            8. If a label is too long, shorten it by choosing the 2–3 most important words, NEVER use ellipsis (...).
+            9. FORBIDDEN: Any use of "..." or ellipsis in node names - this will cause diagram generation to fail.
+            10. REQUIRED: All node labels must be complete, readable words without any truncation symbols.
+
 
             STRICT ENFORCEMENT RULES:
             1. You MUST use ONLY the components listed in "MUST USE ONLY"
@@ -910,7 +931,7 @@ def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str =
 
         # Configure Gemini API with error handling
         try:
-            genai.configure(api_key="AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ")
+            genai.configure(api_key="AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70")
             model = genai.GenerativeModel('gemini-2.0-flash')
             print("✅ Gemini API configured successfully")
         except Exception as config_error:
@@ -952,6 +973,21 @@ def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str =
             5. Node labels must be 2-3 words maximum
             6. Use vertical layout (TD direction) for better A4 fit
             7. Focus on CORE components only, not every detail
+            8. All the nodes should contain proper & full namings
+
+            CRITICAL NAMING RULES (MUST FOLLOW EXACTLY):
+            1. Every node must have a meaningful, descriptive, and complete label.
+            2. Never output single-letter node names (e.g., "e" or "a").
+            Replace them with full system terms like "Engine", "Endpoint", or "Entity".
+            3. Node labels must use full words, ABSOLUTELY NO truncation or ellipsis (...) ANYWHERE.
+            4. Keep node names short (max 3 words) but fully descriptive.
+            Example: "Data Storage", "Reporting Service", "User Interface".
+            5. Avoid special characters, parentheses, commas, and periods in node labels.
+            6. Always use Title Case (capitalize first letter of each word).
+            7. If system entities are unclear, use safe defaults: "Frontend", "Backend", "Database", "Reporting Service", "API Gateway".
+            8. If a label is too long, shorten it by choosing the 2–3 most important words, NEVER use ellipsis (...).
+            9. FORBIDDEN: Any use of "..." or ellipsis in node names - this will cause diagram generation to fail.
+            10. REQUIRED: All node labels must be complete, readable words without any truncation symbols.
 
             INSTRUCTIONS:
             - Base the diagram on the COMPLETE system described in the full SRS document
@@ -1047,6 +1083,7 @@ def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str =
             5. Node labels must be 2-3 words maximum
             6. Use vertical layout (TD direction) for better A4 fit
             7. Focus on CORE components only, not every detail
+            8. All the nodes should contain proper & full namings
 
             REQUIREMENTS:
             1. Create a professional {diagram_type} diagram showing the COMPLETE system architecture
@@ -1077,6 +1114,20 @@ def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str =
             11. For sequence diagrams: Each participant must be declared separately.
             12. For sequence diagrams: Use ->> for messages, -->> for responses.
             13. Keep diagram code clean and minimal so mmdc can parse it.
+
+            CRITICAL NAMING RULES (MUST FOLLOW EXACTLY):
+            1. Every node must have a meaningful, descriptive, and complete label.
+            2. Never output single-letter node names (e.g., "e" or "a").
+            Replace them with full system terms like "Engine", "Endpoint", or "Entity".
+            3. Node labels must use full words, ABSOLUTELY NO truncation or ellipsis (...) ANYWHERE.
+            4. Keep node names short (max 3 words) but fully descriptive.
+            Example: "Data Storage", "Reporting Service", "User Interface".
+            5. Avoid special characters, parentheses, commas, and periods in node labels.
+            6. Always use Title Case (capitalize first letter of each word).
+            7. If system entities are unclear, use safe defaults: "Frontend", "Backend", "Database", "Reporting Service", "API Gateway".
+            8. If a label is too long, shorten it by choosing the 2–3 most important words, NEVER use ellipsis (...).
+            9. FORBIDDEN: Any use of "..." or ellipsis in node names - this will cause diagram generation to fail.
+            10. REQUIRED: All node labels must be complete, readable words without any truncation symbols.
 
             A4 COMPATIBILITY ENFORCEMENT:
             14. Generate compact, unique diagrams that fit within one A4 portrait page
@@ -2369,7 +2420,7 @@ def generate_content_for_heading(heading: str, purpose: str, source: str, upload
 
         # Configure Gemini API with error handling
         try:
-            genai.configure(api_key="AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ")
+            genai.configure(api_key="AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70")
             model = genai.GenerativeModel('gemini-2.0-flash')
             print("✅ Gemini API configured for content generation")
         except Exception as config_error:
@@ -2722,17 +2773,27 @@ def cleanup_diagram_for_a4(mermaid_code: str) -> str:
 
         lines = subgraph_lines
 
-    # Clean up node labels to be shorter
+    # Clean up node labels to be shorter but meaningful (NO ELLIPSIS)
     cleaned_lines = []
     for line in lines:
         # Shorten node labels if they're too long
         if '[' in line and ']' in line:
-            # Find and shorten node labels
+            # Find and shorten node labels properly without ellipsis
             def shorten_label(match):
                 label = match.group(1)
                 if len(label) > 15:
-                    # Keep first and last few characters, add ellipsis
-                    return f'[{label[:8]}...{label[-4:]}]'
+                    # Split into words and keep the most important ones
+                    words = label.split()
+                    if len(words) > 3:
+                        # Keep first 2-3 most important words
+                        shortened = ' '.join(words[:3])
+                    elif len(words) > 1:
+                        # Keep first 2 words
+                        shortened = ' '.join(words[:2])
+                    else:
+                        # Single long word - keep first 12 characters
+                        shortened = label[:12]
+                    return f'[{shortened}]'
                 return match.group(0)
 
             line = re.sub(r'\[([^\]]+)\]', shorten_label, line)
@@ -2806,7 +2867,7 @@ def generate_sequence_diagram_specialized(heading: str, content: str, uploaded_c
         print(f"🎯 Using specialized sequence diagram generation for: {heading}")
 
         # Configure Gemini API
-        genai.configure(api_key="AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ")
+        genai.configure(api_key="AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70")
         model = genai.GenerativeModel('gemini-2.0-flash')
 
         # Specialized prompt for sequence diagrams

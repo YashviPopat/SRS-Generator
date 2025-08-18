@@ -38,7 +38,7 @@ def setup_environment():
         
         # Create .env file with template content
         env_content = """# API Keys for AI Services
-GEMINI_API_KEY=AIzaSyDERZ7x4BcVGLwJM1ucGO02hFW2PTKodaQ
+GEMINI_API_KEY=AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70
 
 # Server Configuration
 HOST=127.0.0.1
