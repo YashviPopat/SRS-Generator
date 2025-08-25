@@ -17,7 +17,7 @@
       "Sequence Diagram": "Visual representation of how system components interact over time to accomplish specific tasks."
     },
     "Functional Requirements": {
-      "Use Case 1": "If applicable regarding to topic: It gives the details of the use case."
+      "Functional Requirements": "If applicable give regarding to Use Case: It gives the detaFunctional Requirements of particular case."
     },
     "Non-Functional Requirements": {
       "Non-Functional Requirements": "Performance, reliability, usability, etc."

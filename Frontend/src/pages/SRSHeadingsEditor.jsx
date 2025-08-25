@@ -928,7 +928,9 @@ const SRSHeadingsEditor = () => {
         body: JSON.stringify({
           selectedHeadings: allSelectedHeadings,
           customInstructions, // Only present if user said 'apply to all sections'
-          meetingSummary: meetingSummary
+          meetingSummary: meetingSummary,
+          // Ensure backend receives the user-entered project title
+          projectTitle: documentData?.projectTitle || documentData?.title || ''
         }),
       });
       if (response.ok) {

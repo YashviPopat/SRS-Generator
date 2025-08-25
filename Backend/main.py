@@ -28,7 +28,7 @@ gemini_api_key = os.getenv("GEMINI_API_KEY")
 if not gemini_api_key:
     print("⚠️ Warning: GEMINI_API_KEY not found in environment variables")
     print("💡 Please set GEMINI_API_KEY in your .env file or system environment")
-    gemini_api_key = "AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70"  # Fallback for development
+    gemini_api_key = "AIzaSyDS7AmlDi1cweQS1p-mJAUlB3uYHrYJXfI"  # Fallback for development
 
 # Import our models and utilities
 from models.srs_model import *
@@ -137,7 +137,7 @@ If no clear headings are found, extract any text that appears to be a section ti
 Be thorough and extract as many headings as possible from the document structure.
 
 Document Content:
-{content[:8000]}"""  # Limit content to avoid token limits
+{content[:8000]}"""
 
         response = model.generate_content(prompt)
         toc_text = response.text
@@ -164,31 +164,44 @@ async def generate_headings_with_gemini(toc_result: dict):
             print("⚠️ No TOC text available for OpenAI")
             return {"openai_headings": ""}
         prompt = f"""
-        Given this content from meeting documents:
+        You are an experienced business analyst. From the following source material, propose a complete SRS outline that conforms to IEEE 29148 and reads as if written by a professional analyst.
+
+        SOURCE EXTRACT:
         {toc_text}
 
-        Generate well-structured SRS (Software Requirements Specification) headings suitable for a project document.
-        Analyze the content and create headings that would be appropriate for documenting software requirements.
-        
-        Return the result as a JSON object in this format: {{"Heading": {{"Subheading": "Purpose", ...}}, ...}}
-        If a heading has no subheadings, use a string as the value for its purpose.
-        
-        Focus on creating headings that are relevant to the content and suitable for SRS documentation.
-        Common SRS headings include: Introduction, Functional Requirements, Non-Functional Requirements, System Architecture, User Interface, Data Requirements, etc.
+        OUTPUT REQUIREMENTS:
+        1) Return a single valid JSON object. Keys are section titles and values are either a string (purpose) or a nested object of subsections.
+        2) Do not include markdown or commentary.
+        3) Titles should be clean (no trailing dots, page numbers, or artifacts). You may include numbering in the title text (e.g., "1.0 Introduction") if it improves clarity.
+
+        STRUCTURE TO COVER (adjust as needed based on the source, but keep the order):
+        - Title Page (Project Name, Document Title, Version, Date, Authors, Confidentiality)
+        - Document Control (Version History table; Approvals)
+        - Table of Contents
+        - 1.0 Introduction
+          - 1.1 Purpose
+          - 1.2 Scope
+          - 1.3 Definitions, Acronyms, and Abbreviations
+          - 1.4 References
+          - 1.5 Overview
+        - 2.0 Overall Description (product perspective, users, assumptions, constraints)
+        - 3.0 System Features and Functional Requirements (group related features and their high-level requirements)
+        - 4.0 External Interface Requirements (UI, API, Data, Hardware)
+        - 5.0 Non-Functional Requirements (performance, security, availability, usability, compliance)
+        - 6.0 System Architecture and Design (include references to figures and diagrams)
+        - 7.0 Data Requirements (entities, models)
+        - 8.0 Constraints and Dependencies
+        - 9.0 Acceptance and Verification
+        - 10.0 Appendices (glossary, assumptions)
+
+        JSON FORMAT EXAMPLE (abbreviated):
+        {{
+          "1.0 Introduction": {{
+            "1.1 Purpose": "Explain the purpose of the SRS concisely.",
+            "1.2 Scope": "Define the scope and boundaries of the system."
+          }}
+        }}
         """
-        # Note: This fallback is kept for compatibility but shouldn't be needed with Gemini
-        # if not os.getenv('GEMINI_API_KEY'):
-        #     print("❌ No Gemini API key found. Please set GEMINI_API_KEY environment variable.")
-        #     print("🔧 Returning sample headings for testing...")
-        #     sample_headings = {
-        #         "Introduction": "Overview and purpose of the system",
-        #         "Functional Requirements": "Core system functions and features",
-        #         "Non-Functional Requirements": "Performance, security, and usability requirements",
-        #         "System Architecture": "Technical design and component structure",
-        #         "User Interface": "UI/UX specifications and wireframes"
-        #     }
-        #     print(f"🔧 Sample headings: {sample_headings}")
-        #     return {"openai_headings": sample_headings}
         model = genai.GenerativeModel('gemini-2.0-flash')
         response = model.generate_content(prompt)
         gemini_text = response.text.strip()
@@ -982,7 +995,8 @@ async def generate_srs_document(request: Dict[str, Any]):
                 'purpose': heading_data['purpose'],
                 'category': heading_data.get('category', 'Other'),
                 'source': heading_data.get('source', 'Unknown'),
-                'userPrompt': heading_data.get('userPrompt', '')
+                'userPrompt': heading_data.get('userPrompt', ''),
+                'projectTitle': request.get('projectTitle', '')
             })
         
         # Add custom sections (if any are sent separately - this should be empty now)
@@ -1028,7 +1042,47 @@ async def generate_srs_document(request: Dict[str, Any]):
             print(f"📄 Content preview: {uploaded_content[:200]}...")
         
         # Generate SRS and get the actual generated diagrams
-        generated_diagrams = generate_srs_docx(all_headings, output_path, uploaded_content)
+        # Try to get project title from multiple possible sources (robust)
+        project_title = ""
+
+        # 1) Explicit fields in the request body
+        for key in [
+            'projectTitle', 'project_title', 'projectName', 'project_name',
+            'title', 'name'
+        ]:
+            if request.get(key):
+                project_title = request.get(key)
+                print(f"📋 Using project title from request field '{key}': '{project_title}'")
+                break
+
+        # 2) Structure store (if provided)
+        if not project_title and 'structureId' in request:
+            structure_id = request.get('structureId', '')
+            if structure_id in srs_structures:
+                project_title = srs_structures[structure_id].get('project_title', '')
+                print(f"📋 Using project title from structure: '{project_title}'")
+            else:
+                print(f"⚠️ Structure ID '{structure_id}' not found in srs_structures")
+
+        # 3) Fallback: infer from uploaded meeting summaries file names
+        if not project_title and extracted_text_content:
+            try:
+                # Choose the first meeting summary file name (without extension)
+                for doc_id, info in extracted_text_content.items():
+                    file_name = info.get('file_name') or info.get('name')
+                    if file_name:
+                        project_title = os.path.splitext(file_name)[0]
+                        print(f"📋 Inferred project title from file name: '{project_title}'")
+                        break
+            except Exception as infer_err:
+                print(f"⚠️ Could not infer project title from files: {infer_err}")
+
+        # 4) Final fallback: default title
+        if not project_title:
+            project_title = "SRS Project"
+            print(f"📋 Using default project title: '{project_title}'")
+
+        generated_diagrams = generate_srs_docx(all_headings, output_path, uploaded_content, project_title)
 
         # Store diagrams for this document
         if generated_diagrams:
@@ -1054,6 +1108,10 @@ async def generate_srs_document(request: Dict[str, Any]):
         return response
         
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"❌ Detailed error in generate_srs_document:")
+        print(error_details)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to generate SRS document: {str(e)}"

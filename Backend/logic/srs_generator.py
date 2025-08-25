@@ -6,9 +6,11 @@ Generates DOCX documents from selected headings and their content
 
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
 from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml.shared import OxmlElement, qn
+from docx.oxml.ns import nsdecls, qn
+from docx.oxml import parse_xml
 import os
 import subprocess
 import tempfile
@@ -18,6 +20,8 @@ from typing import List, Dict, Any
 import google.generativeai as genai
 import re
 import hashlib
+import markdown
+from bs4 import BeautifulSoup
 
 # Global variable to store generated diagrams for the current document
 current_document_diagrams = []
@@ -32,6 +36,107 @@ generated_diagram_token_signatures = []
 
 # Global set to track diagram signatures and prevent duplicates
 generated_diagram_signatures = set()
+
+# Specific prompts for each standard heading
+HEADING_SPECIFIC_PROMPTS = {
+    "Document Purpose": """
+    Give me the Document Purpose in 1 paragraph of 4 to 5 lines.
+    """,
+
+    "Project Purpose": """
+    Give me the Project Purpose in 1 paragraph of 4 to 5 lines.
+    """,
+
+    "Project Objectives": """
+    Give me Project Objectives as point & sub-point wise with one-line description each.
+    """,
+
+    "Project Stakeholders": """
+    List Project Stakeholders in a table with Role, Name, and Email.
+    """,
+
+    "Scope": """
+    Give me table with columns Module, Sub Module, Features columns for each usecases.
+    """,
+
+    "Assumptions": """
+    Give me Assumptions as a numbered list with each assumption in 1–2 lines.
+    """,
+    
+    "Acronyms and Abbreviations" : """Give me Acronyms and Abbreviations in a two-column table: Acronym and Full Form.""",
+    
+    "User Personas" : """Give me each User Persona in 1 paragraph of 5–6 lines covering role, responsibilities, challenges, and benefits.""",
+
+    "Functional Requirements": """
+    Specify detailed functional requirements with preconditions, postconditions, normal flows, alternate flows, exception handling scenarios for each use case. Include field validations, business rules, role-based permissions, audit requirements, and data processing rules for each uses.
+    """,
+
+    "Non-Functional Requirements": """
+    Define quantified, testable non-functional requirements including performance metrics, scalability targets, reliability standards, security requirements, usability criteria, maintainability standards, and compliance requirements.
+    """,
+
+    "System Architecture": """
+    Describe the system architecture with component interactions, data flows, integration patterns, deployment topology, and technology stack. Include architectural patterns, design principles, scalability considerations, security architecture, and operational architecture.
+    """,
+
+    "Hardware Requirements": """
+    Specify detailed hardware requirements including server specifications, network infrastructure, storage requirements, client device specifications, and environmental requirements. Include capacity planning, redundancy requirements, and hardware lifecycle considerations.
+    """,
+
+    "Software Requirements": """
+    Define software requirements including operating systems, middleware, databases, development tools, runtime environments, and third-party software dependencies. Include version requirements, licensing considerations, and compatibility matrices.
+    """,
+
+    "User Interface Requirements": """
+    Specify user interface requirements including usability standards, accessibility requirements, responsive design criteria, user experience guidelines, and interface design patterns. Include wireframes references, interaction flows, and visual design standards.
+    """,
+
+    "Integration Requirements": """
+    Specify integration requirements including API specifications, data exchange formats, communication protocols, authentication mechanisms, and error handling procedures. Include integration patterns, service level agreements, and monitoring requirements.
+    """,
+
+    "Security Requirements": """
+    Define comprehensive security requirements including authentication, authorization, data protection, network security, application security, and operational security. Include threat modeling, security controls, compliance requirements, and incident response procedures.
+    """,
+    
+    "Product Future": """
+    Give me Product Future in 1 paragraph of 4–5 lines highlighting roadmap and upcoming features.
+    """,
+    
+    "Acceptance Criteria": """
+    Define detailed acceptance criteria including functional acceptance criteria, performance acceptance criteria, security acceptance criteria, and operational acceptance criteria. Include test scenarios, success metrics, and sign-off procedures with measurable outcomes and validation methods.
+    """,
+    
+        "Open Queries": """
+    List Open Queries as a numbered list with each query in 1–2 lines.
+    """
+}
+
+# Base IEEE 29148 formatting directives that apply to all headings
+BASE_IEEE_DIRECTIVES = """
+IEEE 29148 STYLE AND FORMATTING DIRECTIVES:
+1. Write in precise, formal prose suitable for contractual and technical documentation.
+2. Use present tense and the keyword "shall" for all mandatory requirements.
+3. Begin content immediately under the section heading with no prefatory labels or commentary.
+4. Use structured paragraphs and bullet points (•) for requirements or subpoints; avoid numbered lists such as 1.1, 1.2, etc.
+5. Ensure every requirement is atomic, testable, and unambiguous; avoid vague or compound statements.
+6. Maintain consistency in terminology (system, actor, module, interface) across all sections.
+7. Do not reference the source of requirements (e.g., “meeting notes,” “uploaded document”); write as if original to the SRS.
+8. Reference diagrams textually only as "Figure x.y" without embedding them.
+9. Preserve a professional tone and avoid casual expressions.
+10. Not put spacing between two bullet points in the SRS, formatted to appear as a polished deliverable.
+11. Ensure structure follows the expected Table of Contents for SRS (Introduction, Scope, Stakeholders, Requirements, Architecture, NFRs, etc.).
+12. Expand each section with sufficient depth to resemble an analyst’s authored SRS, not a summary or checklist.
+"""
+
+def get_heading_specific_prompt(heading: str) -> str:
+    """
+    Get the specific prompt for a given heading, or return a generic prompt if not found
+    """
+    return HEADING_SPECIFIC_PROMPTS.get(heading, """
+    Generate comprehensive content for this section that aligns with professional SRS standards.
+    Include detailed specifications, requirements, and implementation guidance appropriate for this section type.
+    """)
 
 def reset_diagram_counter():
     """Reset the global diagram counter for a new document"""
@@ -248,7 +353,7 @@ def fix_mermaid_with_gemini(broken_code: str, error_message: str) -> str:
     try:
         import google.generativeai as genai
 
-        genai.configure(api_key="AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70")
+        genai.configure(api_key="AIzaSyDS7AmlDi1cweQS1p-mJAUlB3uYHrYJXfI")
         model = genai.GenerativeModel('gemini-2.0-flash')
 
         prompt = f"""
@@ -672,7 +777,7 @@ def generate_sub_diagrams(heading: str, content: str, diagram_type: str, model, 
             5. Node labels must be 2-3 words maximum
             6. Use vertical layout (TD direction) for better A4 fit
             7. Focus on CORE components only, not every detail
-            
+
             CRITICAL NAMING RULES (MUST FOLLOW EXACTLY):
             1. Every node must have a meaningful, descriptive, and complete label.
             2. Never output single-letter node names (e.g., "e" or "a").
@@ -931,7 +1036,7 @@ def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str =
 
         # Configure Gemini API with error handling
         try:
-            genai.configure(api_key="AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70")
+            genai.configure(api_key="AIzaSyDS7AmlDi1cweQS1p-mJAUlB3uYHrYJXfI")
             model = genai.GenerativeModel('gemini-2.0-flash')
             print("✅ Gemini API configured successfully")
         except Exception as config_error:
@@ -958,10 +1063,10 @@ def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str =
 
             SECTION HEADING: {heading}
             SECTION CONTENT: {content}
-            SYSTEM CONTEXT: {uploaded_content if uploaded_content else "No additional context"}
+            SOURCE OF TRUTH: Full SRS (ignore any meeting/transcript inputs)
 
             FULL SRS DOCUMENT CONTEXT:
-            {full_srs_content if full_srs_content else "No full SRS context available"}
+            {full_srs_content if full_srs_content else content}
 
             DIAGRAM TYPE TO GENERATE: {diagram_type}
 
@@ -1068,10 +1173,10 @@ def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str =
 
             SECTION HEADING: {heading}
             SECTION CONTENT: {content}
-            MEETING CONTEXT: {uploaded_content if uploaded_content else "No additional context"}
+            SOURCE OF TRUTH: Full SRS (ignore meeting summaries)
 
             FULL SRS DOCUMENT CONTEXT:
-            {full_srs_content if full_srs_content else "No full SRS context available"}
+            {full_srs_content if full_srs_content else content}
 
             DIAGRAM TYPE: {diagram_type}
 
@@ -1235,11 +1340,12 @@ def generate_mermaid_diagram(heading: str, content: str, uploaded_content: str =
 
             # Only generate sub-diagrams if the original is actually too complex
             if complexity['is_too_complex']:
-                print(f"⚠️ Diagram too complex for A4 page, generating sub-diagrams...")
+                print(f"⚠️ Diagram too complex for A4 page, skipping for performance...")
                 print(f"📋 Issues: {', '.join(complexity['suggestions'])}")
 
-                # Generate multiple focused sub-diagrams
-                sub_diagrams = generate_sub_diagrams(heading, content, diagram_type, model, fixed_mermaid_code)
+                # Skip sub-diagram generation for faster processing
+                # sub_diagrams = generate_sub_diagrams(heading, content, diagram_type, model, fixed_mermaid_code)
+                sub_diagrams = []
 
                 if sub_diagrams and len(sub_diagrams) > 1:
                     print(f"✅ Generated {len(sub_diagrams)} sub-diagrams for better A4 fit")
@@ -1800,7 +1906,7 @@ def insert_diagram_with_a4_optimization(doc: Document, diagram_path: str, headin
         print(f"❌ Error in A4-optimized diagram insertion: {e}")
         return False
 
-def generate_srs_docx(headings: List[Dict[str, Any]], output_path: str, uploaded_content: str = ""):
+def generate_srs_docx(headings: List[Dict[str, Any]], output_path: str, uploaded_content: str = "", project_title: str = ""):
     """
     Generate SRS document in DOCX format from selected headings
 
@@ -1825,8 +1931,12 @@ def generate_srs_docx(headings: List[Dict[str, Any]], output_path: str, uploaded
         # Set up document styles
         setup_document_styles(doc)
 
-        # Add title page
-        add_title_page(doc)
+        # Set up header and footer
+        logo_path = os.path.join(os.path.dirname(__file__), '..', 'srs_logo.png')
+        setup_header_footer(doc, logo_path)
+
+        # Add title page with logo and project name
+        add_title_page(doc, project_title)
 
         # Add table of contents
         add_table_of_contents(doc, headings)
@@ -1838,6 +1948,9 @@ def generate_srs_docx(headings: List[Dict[str, Any]], output_path: str, uploaded
         doc.save(output_path)
 
         print(f"✅ SRS document generated successfully: {output_path}")
+
+        # Force footer refresh to ensure changes take effect
+        force_footer_refresh(doc)
 
         # Print diagram generation summary
         print_diagram_generation_summary()
@@ -1855,79 +1968,669 @@ def setup_document_styles(doc: Document):
         # Title style
         title_style = doc.styles.add_style('SRS Title', WD_STYLE_TYPE.PARAGRAPH)
         title_font = title_style.font
-        title_font.name = 'Arial'
+        title_font.name = 'Cambria'
         title_font.size = Pt(24)
         title_font.bold = True
+        title_font.color.rgb = RGBColor(0, 0, 0)  # Black
         title_style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
         title_style.paragraph_format.space_after = Pt(12)
+        title_style.paragraph_format.line_spacing = 1.0  # Single spacing
 
-        # Heading 1 style
+        # Heading 1 style - Light Blue
         h1_style = doc.styles.add_style('SRS Heading 1', WD_STYLE_TYPE.PARAGRAPH)
         h1_font = h1_style.font
-        h1_font.name = 'Arial'
+        h1_font.name = 'Cambria'
         h1_font.size = Pt(16)
         h1_font.bold = True
+        h1_font.color.rgb = RGBColor(70, 130, 180)  # Light Blue (Steel Blue)
         h1_style.paragraph_format.space_before = Pt(12)
         h1_style.paragraph_format.space_after = Pt(6)
+        h1_style.paragraph_format.line_spacing = 1.0  # Single spacing
 
-        # Heading 2 style
+        # Heading 2 style - Light Blue
         h2_style = doc.styles.add_style('SRS Heading 2', WD_STYLE_TYPE.PARAGRAPH)
         h2_font = h2_style.font
-        h2_font.name = 'Arial'
+        h2_font.name = 'Cambria'
         h2_font.size = Pt(14)
         h2_font.bold = True
+        h2_font.color.rgb = RGBColor(70, 130, 180)  # Light Blue (Steel Blue)
         h2_style.paragraph_format.space_before = Pt(10)
         h2_style.paragraph_format.space_after = Pt(6)
+        h2_style.paragraph_format.line_spacing = 1.0  # Single spacing
 
-        # Heading 3 style
+        # Heading 3 style - Light Blue
         h3_style = doc.styles.add_style('SRS Heading 3', WD_STYLE_TYPE.PARAGRAPH)
         h3_font = h3_style.font
-        h3_font.name = 'Arial'
+        h3_font.name = 'Cambria'
         h3_font.size = Pt(12)
         h3_font.bold = True
+        h3_font.color.rgb = RGBColor(70, 130, 180)  # Light Blue (Steel Blue)
         h3_style.paragraph_format.space_before = Pt(8)
         h3_style.paragraph_format.space_after = Pt(4)
+        h3_style.paragraph_format.line_spacing = 1.0  # Single spacing
 
-        # Normal text style
+        # Normal text style - Black
         normal_style = doc.styles.add_style('SRS Normal', WD_STYLE_TYPE.PARAGRAPH)
         normal_font = normal_style.font
-        normal_font.name = 'Arial'
+        normal_font.name = 'Cambria'
         normal_font.size = Pt(11)
+        normal_font.color.rgb = RGBColor(0, 0, 0)  # Black
         normal_style.paragraph_format.space_after = Pt(6)
+        normal_style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        normal_style.paragraph_format.line_spacing = 1.0  # Single spacing
 
     except Exception as e:
         print(f"⚠️ Warning: Could not set up custom styles: {e}")
 
-def add_title_page(doc: Document):
-    """Add title page to the document"""
-    # Add title
-    title = doc.add_paragraph('Software Requirements Specification', style='SRS Title')
+def setup_header_footer(doc: Document, logo_path: str = None):
+    """Set up document header and footer for ALL sections"""
+    try:
+        # Apply to ALL sections, not just the first one
+        for section_idx, section in enumerate(doc.sections):
+            print(f"🔧 Setting up header/footer for section {section_idx + 1}/{len(doc.sections)}")
+
+            # Setup Header
+            header = section.header
+            header_para = header.paragraphs[0]
+            header_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT  # Right align for logo
+
+            if logo_path and os.path.exists(logo_path):
+                # Add logo to header (right side)
+                run = header_para.runs[0] if header_para.runs else header_para.add_run()
+                run.add_picture(logo_path, width=Inches(2.0))
+            else:
+                # Add text logo if no image available (right aligned)
+                header_para.text = "SRS Document"
+                for run in header_para.runs:
+                    run.font.bold = True
+                    run.font.size = Pt(14)
+
+            # Ensure footers appear on all pages (no special first-page footer)
+            try:
+                section.different_first_page_header_footer = False
+            except Exception:
+                pass
+            try:
+                section.footer_distance = Inches(0.4)
+            except Exception:
+                pass
+
+            # Compute content width (page width minus margins)
+            page_width = section.page_width.inches
+            left_margin = section.left_margin.inches
+            right_margin = section.right_margin.inches
+            content_width = page_width - left_margin - right_margin
+
+            def _build_footer(ftr):
+                if not ftr:
+                    return
+
+                # Clear footer completely (remove all existing paragraphs)
+                for para in ftr.paragraphs:
+                    p = para._element
+                    p.getparent().remove(p)
+
+                # Create one clean paragraph
+                p = ftr.add_paragraph()
+                p.style.font.size = Pt(9)
+
+                # PERFECT FOOTER PARAMETERS - analyzed from your example
+                # A4 page: 21cm width, typical margins: 2.5cm left + 2.5cm right = 16cm content
+                # But footer should use FULL page width for maximum spread
+
+                tabs = p.paragraph_format.tab_stops
+                tabs.clear_all()
+                from docx.shared import Cm
+
+                # Set paragraph formatting for maximum spread
+                pf = p.paragraph_format
+                pf.left_indent = Cm(-2.0)   # Push far beyond normal left margin
+                pf.right_indent = Cm(-2.0)  # Pull far beyond normal right margin
+                pf.first_line_indent = Cm(0)
+                pf.space_before = Pt(0)
+                pf.space_after = Pt(0)
+
+                # Right tab positioned slightly more left (17cm for better A4 visibility)
+                tabs.add_tab_stop(Cm(17), WD_TAB_ALIGNMENT.RIGHT)
+
+                # Add left text
+                left_run = p.add_run("Software Requirement Specification")
+                left_run.font.name = 'Cambria'
+                left_run.font.size = Pt(10)
+                left_run.font.color.rgb = RGBColor(0, 0, 0)
+
+                # Add tab (moves cursor to right tab stop)
+                p.add_run("\t")
+
+                # Add right text with page fields (7pt dark format)
+                page_run = p.add_run("Page ")
+                page_run.font.name = 'Cambria'
+                page_run.font.size = Pt(7)  # 7pt font size
+                page_run.font.color.rgb = RGBColor(0, 0, 0)  # Dark color
+
+                # Helper function to add fields (your exact implementation)
+                def add_field(run, field_type):
+                    fldChar1 = OxmlElement('w:fldChar')
+                    fldChar1.set(qn('w:fldCharType'), 'begin')
+                    instrText = OxmlElement('w:instrText')
+                    instrText.text = field_type
+                    fldChar2 = OxmlElement('w:fldChar')
+                    fldChar2.set(qn('w:fldCharType'), 'separate')
+                    fldChar3 = OxmlElement('w:fldChar')
+                    fldChar3.set(qn('w:fldCharType'), 'end')
+                    run._r.append(fldChar1)
+                    run._r.append(instrText)
+                    run._r.append(fldChar2)
+                    run._r.append(fldChar3)
+
+                # Add PAGE field (7pt dark format)
+                r1 = p.add_run()
+                r1.font.name = 'Cambria'
+                r1.font.size = Pt(7)  # 7pt font size
+                r1.font.color.rgb = RGBColor(0, 0, 0)  # Dark color
+                add_field(r1, "PAGE")
+
+                # Add " of " (7pt dark format)
+                of_run = p.add_run(" of ")
+                of_run.font.name = 'Cambria'
+                of_run.font.size = Pt(7)  # 7pt font size
+                of_run.font.color.rgb = RGBColor(0, 0, 0)  # Dark color
+
+                # Add NUMPAGES field (7pt dark format)
+                r2 = p.add_run()
+                r2.font.name = 'Cambria'
+                r2.font.size = Pt(7)  # 7pt font size
+                r2.font.color.rgb = RGBColor(0, 0, 0)  # Dark color
+                add_field(r2, "NUMPAGES")
+
+            # Build footer for all variants to be safe
+            _build_footer(getattr(section, 'footer', None))
+            _build_footer(getattr(section, 'first_page_footer', None))
+            _build_footer(getattr(section, 'even_page_footer', None))
+
+        print("✅ Header and footer setup completed for all sections")
+
+    except Exception as e:
+        print(f"⚠️ Warning: Could not set up header/footer: {e}")
+
+def force_footer_refresh(doc: Document):
+    """Force refresh of footers to ensure changes take effect"""
+    try:
+        print("🔄 Forcing footer refresh across all sections...")
+        for section_idx, section in enumerate(doc.sections):
+            # Force footer to be different first page = False
+            section.different_first_page_header_footer = False
+
+            # Ensure footer distance is set
+            section.footer_distance = Inches(0.4)
+
+            print(f"✅ Section {section_idx + 1} footer refreshed")
+
+        print("✅ All footers refreshed successfully")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not refresh footers: {e}")
+
+def _add_markdown_runs(paragraph, text: str):
+    """Render enhanced Markdown (**bold**, *italic*) into python-docx runs.
+    If no markdown tokens present, add plain text run.
+    """
+    import re
+    tokens = []
+    i = 0
+    while i < len(text):
+        if text.startswith('**', i):
+            j = text.find('**', i+2)
+            if j != -1:
+                tokens.append(('bold', text[i+2:j]))
+                i = j + 2
+                continue
+        if text.startswith('*', i) and not text.startswith('**', i):
+            j = text.find('*', i+1)
+            if j != -1 and not text.startswith('**', j-1):
+                tokens.append(('italic', text[i+1:j]))
+                i = j + 1
+                continue
+        # plain text chunk
+        next_special = len(text)
+        n1 = text.find('**', i)
+        n2 = text.find('*', i)
+        candidates = [n for n in [n1, n2] if n != -1]
+        if candidates:
+            next_special = min(candidates)
+        tokens.append(('plain', text[i:next_special]))
+        i = next_special
+
+    # write runs
+    if not tokens:
+        run = paragraph.add_run(text)
+        # Apply font formatting based on paragraph style
+        _apply_font_formatting(run, paragraph)
+        return
+
+    for token_type, token_text in tokens:
+        if not token_text:
+            continue
+        run = paragraph.add_run(token_text)
+
+        # Apply base font formatting
+        _apply_font_formatting(run, paragraph)
+
+        # Apply markdown formatting
+        if token_type == 'bold':
+            run.font.bold = True
+        elif token_type == 'italic':
+            run.font.italic = True
+
+def _apply_font_formatting(run, paragraph):
+    """Apply consistent font formatting based on paragraph style"""
+    style_name = paragraph.style.name if paragraph.style else 'Normal'
+
+    # Set font name to Cambria
+    run.font.name = 'Cambria'
+
+    # Set colors based on style
+    if 'Heading' in style_name:
+        # Light blue for headings
+        run.font.color.rgb = RGBColor(70, 130, 180)  # Steel Blue
+    else:
+        # Black for content
+        run.font.color.rgb = RGBColor(0, 0, 0)  # Black
+
+def _clean_metadata_from_content(content: str) -> str:
+    """Remove any metadata labels and unwanted numbering that might appear in AI-generated content"""
+    if not content:
+        return content
+
+    lines = content.split('\n')
+    cleaned_lines = []
+
+    import re
+
+    for line in lines:
+        original_line = line
+        line = line.strip()
+
+        # Skip lines that start with metadata labels
+        if (line.startswith('Purpose:') or
+            line.startswith('Source:') or
+            line.startswith('SECTION HEADING:') or
+            line.startswith('Section Heading:') or
+            line.startswith('Heading:')):
+            continue
+
+        # Remove X.Y numbering at the start of lines (1.1, 1.2, etc.)
+        line = re.sub(r'^\d+\.\d+\s+', '', line)
+
+        # If line is not empty after cleaning, add it
+        if line.strip():
+            cleaned_lines.append(line)
+        elif original_line.strip() == '':
+            # Preserve empty lines for formatting
+            cleaned_lines.append('')
+
+    return '\n'.join(cleaned_lines)
+
+def _is_content_subheading(line: str) -> bool:
+    """Detect if a line is a sub-heading within content that should be bold"""
+    line = line.strip()
+
+    # Skip empty lines and bullet points
+    if not line or line.startswith('•') or line.startswith('-'):
+        return False
+
+    # Check for common sub-heading patterns
+    import re
+
+    # Pattern 1: Lines that end with colon (e.g., "System Requirements:")
+    if line.endswith(':') and len(line) > 5 and len(line) < 100:
+        return True
+
+    # Pattern 2: Lines that are short and look like titles (no periods, proper case)
+    if (len(line) < 80 and
+        not line.endswith('.') and
+        not line.startswith('The ') and
+        not line.startswith('This ') and
+        any(word[0].isupper() for word in line.split() if len(word) > 2)):
+
+        # Check if it contains typical sub-heading words
+        subheading_words = ['Requirements', 'Specifications', 'Overview', 'Details',
+                           'Features', 'Components', 'Architecture', 'Design',
+                           'Implementation', 'Configuration', 'Management']
+
+        if any(word in line for word in subheading_words):
+            return True
+
+    # Pattern 3: Lines that start with capital letters and are relatively short
+    if (line[0].isupper() and
+        len(line) < 60 and
+        not line.endswith('.') and
+        ' shall ' not in line.lower() and
+        not line.startswith('The system')):
+        return True
+
+    return False
+def _add_markdown_block(doc: Document, text: str, style_name: str = 'SRS Normal', justify_text: bool = True):
+    """Add a multi-line text block with enhanced markdown support and justification.
+    Supports **bold**, *italic*, bullets, markdown headings, and text justification.
+    Sub-headings within content are made bold.
+    """
+    lines = text.splitlines() if text else []
+    if not lines:
+        doc.add_paragraph('', style=style_name)
+        return
+
+    import re
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = raw.rstrip('\r')
+
+        # Blank line -> blank paragraph
+        if not line.strip():
+            doc.add_paragraph('', style=style_name)
+            i += 1
+            continue
+
+        stripped = line.strip()
+
+        # Detect Markdown table block starting at this line
+        def _is_separator_row(row: str) -> bool:
+            row = row.strip()
+            if not (row.startswith('|') and row.endswith('|')):
+                return False
+            parts = [c.strip() for c in row.strip('|').split('|')]
+            if not parts:
+                return False
+            for p in parts:
+                # ---, :---, ---:, :---:
+                if not re.fullmatch(r':?-{3,}:?', p):
+                    return False
+            return True
+
+        if stripped.startswith('|') and stripped.endswith('|') and (i + 1) < len(lines) and _is_separator_row(lines[i + 1]):
+            # Collect the table lines until a non-pipe or empty line
+            table_lines = [lines[i].strip(), lines[i + 1].strip()]
+            j = i + 2
+            while j < len(lines):
+                ln = lines[j].strip()
+                if ln and ln.startswith('|') and '|' in ln:
+                    table_lines.append(ln)
+                    j += 1
+                else:
+                    break
+
+            # Parse header and rows
+            header_cells = [c.strip() for c in table_lines[0].strip('|').split('|')]
+            data_rows = []
+            for r in table_lines[2:]:  # skip separator row
+                cells = [c.strip() for c in r.strip('|').split('|')]
+                # pad/truncate to header count
+                if len(cells) < len(header_cells):
+                    cells += [''] * (len(header_cells) - len(cells))
+                elif len(cells) > len(header_cells):
+                    cells = cells[:len(header_cells)]
+                data_rows.append(cells)
+
+            # Build docx table
+            rows_count = 1 + len(data_rows)
+            cols_count = max(1, len(header_cells))
+            tbl = doc.add_table(rows=rows_count, cols=cols_count)
+            try:
+                tbl.style = 'Table Grid'
+            except Exception:
+                pass
+            tbl.autofit = True
+
+            # Fill header row (bold)
+            for col, text_cell in enumerate(header_cells):
+                cell = tbl.cell(0, col)
+                cell.text = ''
+                p = cell.paragraphs[0]
+                run = p.add_run(text_cell)
+                run.font.name = 'Cambria'
+                run.font.bold = True
+                run.font.color.rgb = RGBColor(0, 0, 0)
+
+            # Fill data rows
+            for r_idx, row_vals in enumerate(data_rows, start=1):
+                for c_idx, text_cell in enumerate(row_vals):
+                    cell = tbl.cell(r_idx, c_idx)
+                    cell.text = ''
+                    p = cell.paragraphs[0]
+                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    run = p.add_run(text_cell)
+                    run.font.name = 'Cambria'
+                    run.font.color.rgb = RGBColor(0, 0, 0)
+
+            # Advance index past the table block
+            i = j
+            continue
+
+        # Detect markdown headings
+        heading_level = 0
+        content = line
+        if line.lstrip().startswith('### '):
+            heading_level = 3
+            content = line.lstrip()[4:]
+        elif line.lstrip().startswith('## '):
+            heading_level = 2
+            content = line.lstrip()[3:]
+        elif line.lstrip().startswith('# '):
+            heading_level = 1
+            content = line.lstrip()[2:]
+
+        # Check if this looks like a sub-heading (even without markdown syntax)
+        is_subheading = _is_content_subheading(line)
+
+        # If it's a markdown heading, use appropriate heading style
+        if heading_level > 0:
+            if heading_level == 1:
+                p = doc.add_paragraph(style='SRS Heading 1')
+            elif heading_level == 2:
+                p = doc.add_paragraph(style='SRS Heading 2')
+            else:  # heading_level >= 3
+                p = doc.add_paragraph(style='SRS Heading 3')
+            _add_markdown_runs(p, content)
+            i += 1
+            continue
+
+        # If it's a content sub-heading, make it bold
+        elif is_subheading:
+            p = doc.add_paragraph(style=style_name)
+            if justify_text:
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT  # Sub-headings should be left-aligned
+
+            # Make the entire sub-heading bold
+            run = p.add_run(content)
+            _apply_font_formatting(run, p)
+            run.font.bold = True
+            i += 1
+            continue
+
+        # Detect simple bullets
+        bullet = False
+        if line.lstrip().startswith('- '):
+            bullet = True
+            content = line.lstrip()[2:]
+        elif line.lstrip().startswith('* '):
+            bullet = True
+            content = line.lstrip()[2:]
+        else:
+            content = line
+
+        p = doc.add_paragraph(style=style_name)
+
+        # Set text justification for regular paragraphs
+        if justify_text and not bullet:
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+        if bullet:
+            p.add_run('• ')
+
+        # Add markdown-formatted content
+        _add_markdown_runs(p, content)
+
+        i += 1
+
+def process_markdown_to_docx(doc: Document, markdown_text: str, style_name: str = 'Normal'):
+    """Convert markdown text to docx format with enhanced formatting.
+    Supports headings, bold, italic, lists, and code blocks.
+    """
+    try:
+        # Ensure basic styles exist, fallback to built-in styles if SRS styles don't exist
+        try:
+            doc.styles['SRS Normal']
+            style_name = 'SRS Normal'
+            heading_style_1 = 'SRS Heading 1'
+            heading_style_2 = 'SRS Heading 2'
+        except KeyError:
+            # Fallback to built-in styles
+            style_name = 'Normal'
+            heading_style_1 = 'Heading 1'
+            heading_style_2 = 'Heading 2'
+
+        # Convert markdown to HTML
+        html_output = markdown.markdown(markdown_text)
+
+        # Parse HTML to extract plain text with formatting
+        soup = BeautifulSoup(html_output, 'html.parser')
+
+        # Process each element
+        for element in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'code', 'pre']):
+            if element.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                # Handle headings
+                level = int(element.name[1])
+                heading_style = heading_style_1 if level <= 2 else heading_style_2
+                p = doc.add_paragraph(style=heading_style)
+                _add_html_formatted_text(p, element)
+
+            elif element.name == 'p':
+                # Handle paragraphs
+                p = doc.add_paragraph(style=style_name)
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                _add_html_formatted_text(p, element)
+
+            elif element.name in ['ul', 'ol']:
+                # Handle lists
+                for li in element.find_all('li', recursive=False):
+                    p = doc.add_paragraph(style=style_name)
+                    p.add_run('• ')
+                    _add_html_formatted_text(p, li)
+
+            elif element.name in ['code', 'pre']:
+                # Handle code blocks
+                p = doc.add_paragraph(style=style_name)
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = p.add_run(element.get_text())
+                run.font.name = 'Courier New'
+                run.font.size = Pt(10)
+
+    except Exception as e:
+        print(f"⚠️ Warning: Could not process markdown: {e}")
+        # Fallback to simple text processing
+        _add_markdown_block(doc, markdown_text, style_name)
+
+def _add_html_formatted_text(paragraph, element):
+    """Add HTML formatted text to a paragraph with proper formatting."""
+    for content in element.contents:
+        if hasattr(content, 'name'):
+            if content.name == 'strong' or content.name == 'b':
+                run = paragraph.add_run(content.get_text())
+                run.font.bold = True
+            elif content.name == 'em' or content.name == 'i':
+                run = paragraph.add_run(content.get_text())
+                run.font.italic = True
+            elif content.name == 'code':
+                run = paragraph.add_run(content.get_text())
+                run.font.name = 'Courier New'
+            else:
+                paragraph.add_run(content.get_text())
+        else:
+            # Plain text
+            paragraph.add_run(str(content))
+
+def add_title_page(doc: Document, project_title: str = ""):
+    """Add title page to the document with logo and project name"""
+
+    # Add logo at the top center
+    logo_path = os.path.join(os.path.dirname(__file__), '..', 'srs_logo.png')
+    if os.path.exists(logo_path):
+        logo_para = doc.add_paragraph()
+        logo_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        logo_run = logo_para.add_run()
+        logo_run.add_picture(logo_path, width=Inches(3.0))  # Larger logo for title page
+
+        # Add spacing after logo
+        doc.add_paragraph()
+
+    # Add main title
+    doc.add_paragraph('Software Requirements Specification', style='SRS Title')
+
+    # Add spacing
+    doc.add_paragraph()
+
+    # Add project name prominently (if provided)
+    if project_title:
+        proj_para = doc.add_paragraph(style='SRS Title')  # Use title style for prominence
+        proj_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        proj_run = proj_para.add_run(project_title)
+        proj_run.font.size = Pt(20)  # Slightly smaller than main title
+        proj_run.font.bold = True
+        proj_run.font.color.rgb = RGBColor(70, 130, 180)  # Light blue like headings
+
+        # Add spacing after project name
+        doc.add_paragraph()
 
     # Add subtitle
     subtitle = doc.add_paragraph('Generated by SRS Dynamic Generator', style='SRS Normal')
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # Add some spacing
+    # Add more spacing
     doc.add_paragraph()
     doc.add_paragraph()
 
     # Add document info
-    info_para = doc.add_paragraph('Document Information:', style='SRS Heading 2')
+    info_para = doc.add_paragraph('Document Information:', style='SRS Normal')
     info_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    # Make it bold to stand out
+    for run in info_para.runs:
+        run.font.bold = True
 
     # Add document details
     details = [
         ('Document Type:', 'Software Requirements Specification'),
-        ('Generated Date:', 'Auto-generated'),
         ('Tool:', 'SRS Dynamic Generator'),
         ('Version:', '1.0')
     ]
 
     for label, value in details:
-        detail_para = doc.add_paragraph(f'{label} {value}', style='SRS Normal')
+        doc.add_paragraph(f'{label} {value}', style='SRS Normal')
 
     # Add page break
     doc.add_page_break()
+
+def _strip_leading_numbers_preserve_markdown(text: str) -> str:
+    """Remove leading numbering like '2.' or '2.1 - ' from a heading string while preserving **bold** wrappers.
+    Examples:
+    '**2. Heading**' -> '**Heading**'
+    '2.1 Heading' -> 'Heading'
+    """
+    import re
+    if not text:
+        return text
+    # If bold-wrapped, clean inside
+    if text.startswith('**') and text.endswith('**') and len(text) >= 4:
+        inner = text[2:-2]
+        inner = re.sub(r'^\s*\d+(?:\.\d+)*\s*[-\.)]?\s*', '', inner)
+        return f"**{inner}**"
+    # General case
+    return re.sub(r'^\s*\d+(?:\.\d+)*\s*[-\.)]?\s*', '', text)
+
+def _strip_markdown_tokens(text: str) -> str:
+    """Remove simple markdown markers (** and *) from a string."""
+    if not text:
+        return text
+    return text.replace('**', '').replace('*', '')
 
 def add_table_of_contents(doc: Document, headings: List[Dict[str, Any]]):
     """Add table of contents to the document"""
@@ -1953,55 +2656,61 @@ def add_table_of_contents(doc: Document, headings: List[Dict[str, Any]]):
     toc_title = doc.add_paragraph('Table of Contents', style='SRS Heading 1')
     toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # Separate custom sections from other headings
-    custom_sections = []
-    other_headings = []
-
-    for heading in deduplicated_headings:
-        if heading.get('category') == 'Custom':
-            custom_sections.append(heading)
-        else:
-            other_headings.append(heading)
-
-    print(f"🔍 TOC DEBUG: After separation and deduplication:")
-    print(f"   Custom sections: {len(custom_sections)}")
-    for i, section in enumerate(custom_sections):
-        print(f"      TOC Custom {i+1}: {section.get('heading', 'No heading')}")
-
-    # Group non-custom headings by category
+    # Group all headings by category, mapping custom sections to appropriate categories
     categories = {}
-    for heading in other_headings:
+    for heading in deduplicated_headings:
         category = heading.get('category', 'Other')
+
+        # Map custom sections to appropriate existing categories based on content
+        if category == 'Custom':
+            heading_text = heading.get('heading', '').lower()
+            # Try to categorize custom sections intelligently
+            if any(word in heading_text for word in ['requirement', 'functional', 'feature']):
+                category = 'Requirements'
+            elif any(word in heading_text for word in ['design', 'architecture', 'system']):
+                category = 'Design'
+            elif any(word in heading_text for word in ['interface', 'ui', 'user']):
+                category = 'Interface'
+            elif any(word in heading_text for word in ['performance', 'quality', 'non-functional']):
+                category = 'Non-Functional Requirements'
+            else:
+                # Default to Requirements for unclassified custom sections
+                category = 'Requirements'
+
         if category not in categories:
             categories[category] = []
         categories[category].append(heading)
 
-    # Add TOC entries for categorized headings
-    for category, category_headings in categories.items():
-        # Add category header
-        category_para = doc.add_paragraph(category, style='SRS Heading 2')
+    # Define desired category order for numbering
+    desired_order = [
+        'Introduction',
+        'Overall Description',
+        'System Features and Functional Requirements',
+        'External Interface Requirements',
+        'Non-Functional Requirements',
+        'System Architecture and Design',
+        'Data Requirements',
+        'Constraints and Dependencies',
+        'Acceptance and Verification',
+        'Appendices'
+    ]
+    ordered_categories = [c for c in desired_order if c in categories] + [c for c in categories.keys() if c not in desired_order]
+
+    # Add TOC entries for categorized headings with numbering X, X.1, X.2, etc.
+    for top_idx, category in enumerate(ordered_categories, 1):
+        category_headings = categories[category]
+        # Add category header with X (not X.0) - use Normal style for TOC
+        toc_category = doc.add_paragraph(f'{top_idx} {category}', style='SRS Normal')
+        toc_category.runs[0].font.bold = True
 
         # Add headings in this category
-        for i, heading in enumerate(category_headings, 1):
+        for sub_idx, heading in enumerate(category_headings, 1):
             heading_text = heading.get('heading', '')
-            toc_entry = doc.add_paragraph(f'{i}. {heading_text}', style='SRS Normal')
+            cleaned = _strip_markdown_tokens(_strip_leading_numbers_preserve_markdown(heading_text))
+            toc_entry = doc.add_paragraph(f'{top_idx}.{sub_idx} {cleaned}', style='SRS Normal')
             toc_entry.paragraph_format.left_indent = Inches(0.5)
 
-    # Add custom sections as individual TOC entries (no category grouping)
-    if custom_sections:
-        print(f"🔍 TOC: Adding {len(custom_sections)} custom sections to TOC")
-        for i, section in enumerate(custom_sections):
-            print(f"   TOC Custom {i+1}: {section.get('heading', 'No heading')}")
-
-        # Add a separator or header for custom sections
-        custom_header = doc.add_paragraph('Custom Sections', style='SRS Heading 2')
-
-        # Add each custom section as individual entry
-        for i, custom_heading in enumerate(custom_sections, 1):
-            heading_text = custom_heading.get('heading', '')
-            print(f"📝 TOC: Adding entry {i}. {heading_text}")
-            toc_entry = doc.add_paragraph(f'{i}. {heading_text}', style='SRS Normal')
-            toc_entry.paragraph_format.left_indent = Inches(0.5)
+    # Custom sections are now included in regular categories, no special handling needed
 
     # Add page break
     doc.add_page_break()
@@ -2026,26 +2735,27 @@ def add_content_sections(doc: Document, headings: List[Dict[str, Any]], uploaded
 
     print(f"🔧 CONTENT: Deduplicated {len(headings)} → {len(deduplicated_headings)} headings")
 
-    # Separate custom sections from other headings
-    custom_sections = []
-    other_headings = []
-
-    for heading in deduplicated_headings:
-        if heading.get('category') == 'Custom':
-            custom_sections.append(heading)
-        else:
-            other_headings.append(heading)
-
-    print(f"🔍 DEBUG: After separation and deduplication:")
-    print(f"   Custom sections: {len(custom_sections)}")
-    print(f"   Other headings: {len(other_headings)}")
-    for i, section in enumerate(custom_sections):
-        print(f"      Custom {i+1}: {section.get('heading', 'No heading')}")
-
-    # Group non-custom headings by category
+    # Group all headings by category, mapping custom sections to appropriate categories
     categories = {}
-    for heading in other_headings:
+    for heading in deduplicated_headings:
         category = heading.get('category', 'Other')
+
+        # Map custom sections to appropriate existing categories based on content
+        if category == 'Custom':
+            heading_text = heading.get('heading', '').lower()
+            # Try to categorize custom sections intelligently
+            if any(word in heading_text for word in ['requirement', 'functional', 'feature']):
+                category = 'Requirements'
+            elif any(word in heading_text for word in ['design', 'architecture', 'system']):
+                category = 'Design'
+            elif any(word in heading_text for word in ['interface', 'ui', 'user']):
+                category = 'Interface'
+            elif any(word in heading_text for word in ['performance', 'quality', 'non-functional']):
+                category = 'Non-Functional Requirements'
+            else:
+                # Default to Requirements for unclassified custom sections
+                category = 'Requirements'
+
         if category not in categories:
             categories[category] = []
         categories[category].append(heading)
@@ -2059,11 +2769,12 @@ def add_content_sections(doc: Document, headings: List[Dict[str, Any]], uploaded
     for category, category_headings in categories.items():
         for heading in category_headings:
             all_headings_for_processing.append(heading)
-    for custom_heading in custom_sections:
-        all_headings_for_processing.append(custom_heading)
 
-    # Generate content for all headings first
-    for heading in all_headings_for_processing:
+    # Generate content for all headings first (limit to first 5 for performance)
+    print(f"📊 Processing {len(all_headings_for_processing)} headings (limiting to first 5 for performance)")
+    limited_headings = all_headings_for_processing[:5]  # Limit to first 5 headings
+
+    for heading in limited_headings:
         heading_text = heading.get('heading', '')
         purpose = heading.get('purpose', '')
         source = heading.get('source', 'Unknown')
@@ -2094,39 +2805,44 @@ def add_content_sections(doc: Document, headings: List[Dict[str, Any]], uploaded
     # Create a lookup for pre-generated content
     content_lookup = {item['heading']: item for item in all_generated_content}
 
-    # Add content for each category (excluding custom sections)
-    for category, category_headings in categories.items():
-        # Add category header
-        category_para = doc.add_paragraph(category, style='SRS Heading 1')
+    # Define desired category order for consistent numbering
+    desired_order = [
+        'Introduction',
+        'Overall Description',
+        'System Features and Functional Requirements',
+        'External Interface Requirements',
+        'Non-Functional Requirements',
+        'System Architecture and Design',
+        'Data Requirements',
+        'Constraints and Dependencies',
+        'Acceptance and Verification',
+        'Appendices'
+    ]
+    ordered_categories = [c for c in desired_order if c in categories] + [c for c in categories.keys() if c not in desired_order]
+
+    # Add content for each category (excluding custom sections) with numbering X, X.1, X.2, etc.
+    for top_idx, category in enumerate(ordered_categories, 1):
+        category_headings = categories[category]
+        # Add category header with numbering (X not X.0)
+        doc.add_paragraph(f'{top_idx} {category}', style='SRS Heading 1')
 
         # Add content for each heading in this category
-        for heading in category_headings:
+        for sub_idx, heading in enumerate(category_headings, 1):
             heading_text = heading.get('heading', '')
+            # Inject computed numbering into heading dict for downstream rendering
+            heading_with_number = dict(heading)
+            heading_with_number['_number'] = f'{top_idx}.{sub_idx}'
             pre_generated = content_lookup.get(heading_text)
             if pre_generated:
-                add_heading_content_with_pregenerated(doc, heading, uploaded_content, full_srs_content, pre_generated['content'])
+                add_heading_content_with_pregenerated(doc, heading_with_number, uploaded_content, full_srs_content, pre_generated['content'])
             else:
                 # Fallback to old method if not found
-                add_heading_content_with_full_context(doc, heading, uploaded_content, full_srs_content)
+                add_heading_content_with_full_context(doc, heading_with_number, uploaded_content, full_srs_content)
 
         # Add some spacing between categories
         doc.add_paragraph()
 
-    # Add custom sections as individual sections (no category grouping)
-    print(f"🔄 Processing {len(custom_sections)} custom sections...")
-    for custom_heading in custom_sections:
-        heading_text = custom_heading.get('heading', '')
-        print(f"📝 Processing custom section: {heading_text}")
-        pre_generated = content_lookup.get(heading_text)
-        if pre_generated:
-            print(f"✅ Found pre-generated content for: {heading_text}")
-            add_heading_content_with_pregenerated(doc, custom_heading, uploaded_content, full_srs_content, pre_generated['content'])
-        else:
-            print(f"⚠️ No pre-generated content found for: {heading_text}, using fallback")
-            # Fallback to old method if not found
-            add_heading_content_with_full_context(doc, custom_heading, uploaded_content, full_srs_content)
-        # Add spacing between custom sections
-        doc.add_paragraph()
+    # Custom sections are now included in regular categories, no special processing needed
 
 def add_heading_content_with_pregenerated(doc: Document, heading: Dict[str, Any], uploaded_content: str = "", full_srs_content: str = "", pregenerated_content: str = ""):
     """Add content for a specific heading with diagram generation using pre-generated content"""
@@ -2138,27 +2854,27 @@ def add_heading_content_with_pregenerated(doc: Document, heading: Dict[str, Any]
     category = heading.get('category', 'Other')
     user_prompt = heading.get('userPrompt', '')
 
-    # Add heading
-    heading_para = doc.add_paragraph(heading_text, style='SRS Heading 2')
+    # Add heading (supports **bold** and *italic*; apply computed numbering X.Y if provided)
+    number = heading.get('_number')
+    display_text = _strip_leading_numbers_preserve_markdown(heading_text)
+    if number:
+        display_text = f"{number} {display_text}"
+    heading_para = doc.add_paragraph(style='SRS Heading 2')
+    _add_markdown_runs(heading_para, display_text)
 
-    # Add purpose
-    if purpose:
-        purpose_para = doc.add_paragraph(f'Purpose: {purpose}', style='SRS Normal')
-        purpose_para.paragraph_format.left_indent = Inches(0.25)
-
-    # Add source information
-    source_para = doc.add_paragraph(f'Source: {source}', style='SRS Normal')
-    source_para.paragraph_format.left_indent = Inches(0.25)
-    source_para.paragraph_format.space_after = Pt(12)
+    # Remove Purpose and Source metadata as requested
+    # Add spacing after heading
+    heading_para.paragraph_format.space_after = Pt(12)
 
     # Use pre-generated content (no need to call AI again)
     print(f"📄 Using pre-generated content for: {heading_text}")
     generated_content = pregenerated_content
 
-    # Add generated content
-    content_para = doc.add_paragraph(generated_content, style='SRS Normal')
-    content_para.paragraph_format.left_indent = Inches(0.25)
-    content_para.paragraph_format.space_after = Pt(12)
+    # Clean any remaining metadata from content
+    generated_content = _clean_metadata_from_content(generated_content)
+
+    # Add generated content with markdown formatting support
+    _add_markdown_block(doc, generated_content, style_name='SRS Normal')
 
     # Check if this section should have a diagram (considering user prompt)
     diagram_type = should_generate_diagram(heading_text, user_prompt)
@@ -2256,18 +2972,13 @@ def add_heading_content_with_full_context(doc: Document, heading: Dict[str, Any]
     category = heading.get('category', 'Other')
     user_prompt = heading.get('userPrompt', '')
 
-    # Add heading
-    heading_para = doc.add_paragraph(heading_text, style='SRS Heading 2')
+    # Add heading (supports simple Markdown in titles)
+    heading_para = doc.add_paragraph(style='SRS Heading 2')
+    _add_markdown_runs(heading_para, heading_text)
 
-    # Add purpose
-    if purpose:
-        purpose_para = doc.add_paragraph(f'Purpose: {purpose}', style='SRS Normal')
-        purpose_para.paragraph_format.left_indent = Inches(0.25)
-
-    # Add source information
-    source_para = doc.add_paragraph(f'Source: {source}', style='SRS Normal')
-    source_para.paragraph_format.left_indent = Inches(0.25)
-    source_para.paragraph_format.space_after = Pt(12)
+    # Remove Purpose and Source metadata as requested
+    # Add spacing after heading
+    heading_para.paragraph_format.space_after = Pt(12)
 
     # Generate content using AI with uploaded document context and user_prompt
     print(f"📝 Generating content for heading: {heading_text}")
@@ -2279,10 +2990,11 @@ def add_heading_content_with_full_context(doc: Document, heading: Dict[str, Any]
         user_prompt
     )
 
-    # Add generated content
-    content_para = doc.add_paragraph(generated_content, style='SRS Normal')
-    content_para.paragraph_format.left_indent = Inches(0.25)
-    content_para.paragraph_format.space_after = Pt(12)
+    # Clean any remaining metadata from content
+    generated_content = _clean_metadata_from_content(generated_content)
+
+    # Add generated content with markdown formatting support
+    _add_markdown_block(doc, generated_content, style_name='SRS Normal')
 
     # Check if this section should have a diagram (considering user prompt)
     diagram_type = should_generate_diagram(heading_text, user_prompt)
@@ -2420,12 +3132,15 @@ def generate_content_for_heading(heading: str, purpose: str, source: str, upload
 
         # Configure Gemini API with error handling
         try:
-            genai.configure(api_key="AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70")
+            genai.configure(api_key="AIzaSyDS7AmlDi1cweQS1p-mJAUlB3uYHrYJXfI")
             model = genai.GenerativeModel('gemini-2.0-flash')
             print("✅ Gemini API configured for content generation")
         except Exception as config_error:
             print(f"❌ Failed to configure Gemini API: {config_error}")
             return f"Error: Failed to configure Gemini API for '{heading}'. Please check API key and internet connection."
+
+        # Get heading-specific prompt
+        heading_specific_prompt = get_heading_specific_prompt(heading)
 
         # Process user prompt to ensure professional SRS language
         if user_prompt and user_prompt.strip():
@@ -2436,67 +3151,104 @@ def generate_content_for_heading(heading: str, purpose: str, source: str, upload
             professional_prompt = professional_prompt.replace("according to", "based on")
 
             prompt = f"""
-            You are a professional SRS writer for MSBC Group company. Write professional SRS content that follows industry standards.
+            You are a professional SRS analyst writing to IEEE 29148 standard. Produce content that reads like it was authored by a human analyst, not AI.
 
-            USER REQUIREMENTS:
+            USER INPUT CONTEXT:
             {professional_prompt}
 
             SECTION HEADING: {heading}
             SYSTEM CONTEXT: {uploaded_content if uploaded_content else "No additional context available."}
 
-            PROFESSIONAL SRS WRITING REQUIREMENTS:
-            1. Write in formal, professional SRS language
-            2. Do NOT use phrases like "according to meeting transcript" or "based on meeting summary"
-            3. Present information as established system requirements and specifications
-            4. Use industry-standard SRS terminology and structure
-            5. Use bullet points for explanations instead of long paragraphs
-            6. Generate 4-6 concise bullet points for this section
-            7. Each bullet point should be 1-2 sentences maximum
-            8. Focus on key requirements and specifications only
-            9. Avoid repetition of content from other sections
-            10. Maintain clear document hierarchy with unique section names
-            """
+            HEADING-SPECIFIC REQUIREMENTS:
+            {heading_specific_prompt}
+
+            {BASE_IEEE_DIRECTIVES}
+
+7. Do not reference the source of requirements (e.g., “meeting notes,” “uploaded document”); write as if original to the SRS.
+8. Reference diagrams textually only as "Figure x.y" without embedding them.
+9. Preserve a professional tone and avoid casual expressions.
+10. Not put spacing between two bullet points in the SRS, formatted to appear as a polished deliverable.
+11. Ensure structure follows the expected Table of Contents for SRS (Introduction, Scope, Stakeholders, Requirements, Architecture, NFRs, etc.).
+12. Expand each section with sufficient depth to resemble an analyst’s authored SRS, not a summary or checklist.
+"""
         else:
             prompt = f"""
-            You are a professional SRS writer for MSBC Group company. Write professional SRS content that follows industry standards.
+            You are a professional SRS analyst writing to IEEE 29148 standard. Produce content that reads like it was authored by a human analyst, not AI.
 
             SECTION HEADING: {heading}
             SYSTEM CONTEXT: {uploaded_content if uploaded_content else "No additional context available."}
 
-            PROFESSIONAL SRS WRITING REQUIREMENTS:
-            1. Generate detailed professional content for this SRS section
-            2. Write in formal, professional SRS language
-            3. Do NOT use phrases like "according to meeting transcript" or "based on meeting summary"
-            4. Present information as established system requirements and specifications
-            5. Use industry-standard SRS terminology and structure
-            6. Use bullet points for explanations instead of long paragraphs
-            7. Generate 4-6 concise bullet points for this section
-            8. Each bullet point should be 1-2 sentences maximum
-            9. Focus on key requirements and specifications only
-            10. Avoid repetition of content from other sections
-            11. Maintain clear document hierarchy with unique section names
-            12. Use clear, professional language suitable for SRS documentation
+            HEADING-SPECIFIC REQUIREMENTS:
+            {heading_specific_prompt}
 
-            CONTENT STRUCTURE (USE BULLET POINTS):
-            - Start with a brief overview bullet point of what this section covers
-            - Use bullet points for explanations instead of long paragraphs
-            - Include specific system requirements as concise bullet points
-            - Reference technical specifications in bullet format
-            - Include functional and non-functional requirements as bullet points
-            - Mention constraints or considerations as bullet points
-            - Avoid repetition of content from other sections
-            - Maintain clear document hierarchy with unique section names
-
-            BULLET POINT FORMAT EXAMPLES:
-            • Authentication: System implements multi-factor authentication with OAuth 2.0 integration
-            • Database: PostgreSQL database with encrypted data storage and automated backups
-            • API: RESTful API endpoints with rate limiting and comprehensive error handling
-
-            Write in bullet point format suitable for SRS documentation. Each bullet should be concise and informative, drawing from the system context provided above.
-            """
+            {BASE_IEEE_DIRECTIVES}
+1. Write in precise, formal prose suitable for contractual and technical documentation.
+2. Use present tense and the keyword "shall" for all mandatory requirements.
+3. Begin content immediately under the section heading with no prefatory labels or commentary.
+4. Use structured paragraphs and bullet points (•) for requirements or subpoints; avoid numbered lists such as 1.1, 1.2, etc.
+5. Ensure every requirement is atomic, testable, and unambiguous; avoid vague or compound statements.
+6. Maintain consistency in terminology (system, actor, module, interface) across all sections.
+7. Do not reference the source of requirements (e.g., “meeting notes,” “uploaded document”); write as if original to the SRS.
+8. Reference diagrams textually only as "Figure x.y" without embedding them.
+9. Preserve a professional tone and avoid casual expressions.
+10. Not put spacing between two bullet points in the SRS, formatted to appear as a polished deliverable.
+11. Ensure structure follows the expected Table of Contents for SRS (Introduction, Scope, Stakeholders, Requirements, Architecture, NFRs, etc.).
+12. Expand each section with sufficient depth to resemble an analyst’s authored SRS, not a summary or checklist.
+"""
 
         print(f"📤 Sending prompt to Gemini for '{heading}'...")
-        response = model.generate_content(prompt)
+
+        # Add timeout and retry logic
+        import time
+        max_retries = 3
+        timeout_seconds = 30
+
+        for attempt in range(max_retries):
+            try:
+                print(f"🔄 Attempt {attempt + 1}/{max_retries} for '{heading}'...")
+
+                # Set a timeout for the API call
+                import signal
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("Gemini API call timed out")
+
+                # For Windows, we'll use a different approach since signal doesn't work well
+                import threading
+                result = [None]
+                exception = [None]
+
+                def api_call():
+                    try:
+                        result[0] = model.generate_content(prompt)
+                    except Exception as e:
+                        exception[0] = e
+
+                thread = threading.Thread(target=api_call)
+                thread.daemon = True
+                thread.start()
+                thread.join(timeout=timeout_seconds)
+
+                if thread.is_alive():
+                    print(f"⏰ Timeout after {timeout_seconds}s for '{heading}', retrying...")
+                    continue
+
+                if exception[0]:
+                    raise exception[0]
+
+                response = result[0]
+                if response:
+                    break
+
+            except Exception as e:
+                print(f"❌ Attempt {attempt + 1} failed for '{heading}': {str(e)}")
+                if attempt == max_retries - 1:
+                    print(f"💀 All attempts failed for '{heading}', using fallback content")
+                    return f"Content generation failed for '{heading}' after {max_retries} attempts. Please try regenerating this section manually."
+
+                # Wait before retry
+                wait_time = (attempt + 1) * 2  # 2, 4, 6 seconds
+                print(f"⏳ Waiting {wait_time}s before retry...")
+                time.sleep(wait_time)
 
         if response and response.text:
             content = response.text.strip()
@@ -2867,7 +3619,7 @@ def generate_sequence_diagram_specialized(heading: str, content: str, uploaded_c
         print(f"🎯 Using specialized sequence diagram generation for: {heading}")
 
         # Configure Gemini API
-        genai.configure(api_key="AIzaSyCy_-UPCXQrwAHGQg9ntOBHw0NTEdyoJ70")
+        genai.configure(api_key="AIzaSyDS7AmlDi1cweQS1p-mJAUlB3uYHrYJXfI")
         model = genai.GenerativeModel('gemini-2.0-flash')
 
         # Specialized prompt for sequence diagrams
@@ -2876,7 +3628,7 @@ def generate_sequence_diagram_specialized(heading: str, content: str, uploaded_c
 
         SECTION: {heading}
         CONTENT: {content[:600]}
-        CONTEXT: {uploaded_content[:400] if uploaded_content else "No additional context"}
+        FULL SRS CONTEXT: {full_srs_content[:1200] if full_srs_content else content[:1200]}
 
         REQUIREMENTS:
         1. Create a sequence diagram with MAXIMUM 3-4 participants
