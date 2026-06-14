@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SRS Dynamic Generator
 
 A comprehensive Software Requirements Specification (SRS) document generator with AI-powered content generation, interactive diagram editing, and multiple export formats.
@@ -452,3 +453,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ---
 
 **Built with ❤️ using React, FastAPI, and Google Gemini AI**
+=======
+# SRS-Generator
+>>>>>>> c85e9c03c0b929a3d10dd28695b9dee9d86d0929
